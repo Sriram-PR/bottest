@@ -1,0 +1,17 @@
+{
+    "rules": [
+        {
+            "name": "Example Rule",
+            "bot_ids": [
+                123456789
+            ],
+            "trigger": {
+                "embed_title_contains": "Level Up"
+            },
+            "action": {
+                "duration_minutes": 5,
+                "reason": "Automated timeout"
+            }
+        }
+    ]
+}

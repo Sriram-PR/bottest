@@ -1,0 +1,3 @@
+guild install = https://discord.com/oauth2/authorize?client_id=1425522581896822817&permissions=1376537406528&integration_type=0&scope=applications.commands+bot
+
+user install = https://discord.com/oauth2/authorize?client_id=1425522581896822817&permissions=1376537406528&integration_type=1&scope=applications.commands+bot
