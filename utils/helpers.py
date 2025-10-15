@@ -1,8 +1,8 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import discord
 
-from config.settings import TYPE_EMOJIS
+from config.settings import FORMAT_NAMES, TYPE_EMOJIS
 
 
 def capitalize_pokemon_name(name: str) -> str:
@@ -55,30 +55,35 @@ def format_generation_tier(generation: str, tier: str) -> str:
     gen_num = generation.replace("gen", "")
     tier_upper = tier.upper()
 
-    # Special tier formatting
-    tier_names = {
-        "OU": "OverUsed",
-        "UU": "UnderUsed",
-        "RU": "RarelyUsed",
-        "NU": "NeverUsed",
-        "PU": "PU",
-        "ZU": "ZeroUsed",
-        "LC": "Little Cup",
-        "AG": "Anything Goes",
-        "UBERS": "Ubers",
-        "UUBERS": "UUbers",
-        "DOUBLESOU": "Doubles OU",
-        "1V1": "1v1",
-        "MONOTYPE": "Monotype",
-    }
+    # Get full tier name if available
+    tier_full_name = FORMAT_NAMES.get(tier.lower())
 
-    # Check if tier needs expansion
-    if tier_upper in tier_names:
-        tier_display = f"{tier_upper} ({tier_names[tier_upper]})"
+    if tier_full_name:
+        tier_display = f"{tier_upper} ({tier_full_name})"
     else:
         tier_display = tier_upper
 
     return f"Gen {gen_num} {tier_display}"
+
+
+def get_format_display_name(tier: str, set_count: Optional[int] = None) -> str:
+    """
+    Get display name for a format/tier
+
+    Args:
+        tier: Tier string (e.g., 'ou', 'doublesou')
+        set_count: Optional number of sets to display
+
+    Returns:
+        Formatted display name (e.g., 'OU - 5 sets')
+    """
+    tier_upper = tier.upper()
+    display = tier_upper
+
+    if set_count is not None:
+        display += f" - {set_count} set{'s' if set_count != 1 else ''}"
+
+    return display
 
 
 def format_move_list(moves: List[Any]) -> str:
@@ -127,7 +132,7 @@ def format_evs(evs: Dict[str, int]) -> str:
     return " / ".join(formatted) if formatted else "No EVs specified"
 
 
-def format_ivs(ivs: Dict[str, int]) -> str:
+def format_ivs(ivs: Dict[str, int]) -> Optional[str]:
     """
     Format IVs for display (only shows non-31 IVs)
 
@@ -195,7 +200,7 @@ def format_nature(nature: Any) -> str:
     return str(nature) if nature else "Any"
 
 
-def format_tera_type(tera: Any) -> str:
+def format_tera_type(tera: Any) -> Optional[str]:
     """
     Format Tera type with emoji
 
@@ -203,7 +208,7 @@ def format_tera_type(tera: Any) -> str:
         tera: Tera type (string or list)
 
     Returns:
-        Formatted Tera type string
+        Formatted Tera type string or None
     """
     if not tera:
         return None

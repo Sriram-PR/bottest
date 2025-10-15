@@ -47,6 +47,22 @@ async def on_ready():
 
 
 @bot.event
+async def on_close():
+    """Cleanup when bot is shutting down"""
+    logger.info("Bot shutting down, cleaning up resources...")
+
+    # Close API client sessions from all loaded cogs
+    for cog in bot.cogs.values():
+        if hasattr(cog, "api_client"):
+            try:
+                await cog.api_client.close()
+            except Exception as e:
+                logger.error(f"Error closing API client: {e}")
+
+    logger.info("Cleanup complete")
+
+
+@bot.event
 async def on_guild_join(guild):
     logger.info(f"Joined guild: {guild.name} (ID: {guild.id})")
 
@@ -108,8 +124,9 @@ async def help_command(ctx):
             f"`{COMMAND_PREFIX}smogon <pokemon> [generation] [tier]`\n\n"
             f"**Examples:**\n"
             f"`/smogon garchomp`\n"
-            f"`/smogon landorus-therian gen8 ou`\n"
-            f"`{COMMAND_PREFIX}smogon charizard gen7 uu`"
+            f"`/smogon landorus-therian gen8`\n"
+            f"`/smogon charizard gen7 uu`\n"
+            f"`{COMMAND_PREFIX}smogon garchomp gen9 ou`"
         ),
         inline=False,
     )
@@ -119,7 +136,8 @@ async def help_command(ctx):
         value=(
             "**pokemon** - Pokemon name (required)\n"
             "**generation** - gen1 to gen9 (default: gen9)\n"
-            "**tier** - ou, uu, ru, nu, pu, ubers, etc. (default: ou)"
+            "**tier** - ou, uu, ru, nu, pu, ubers, etc. (optional)\n"
+            "• If tier not specified, bot will search all tiers"
         ),
         inline=False,
     )
@@ -131,7 +149,19 @@ async def help_command(ctx):
             "Ubers, UUbers\n"
             "LC (Little Cup)\n"
             "VGC, Doubles OU\n"
-            "1v1, Monotype, AG (Anything Goes)"
+            "1v1, Monotype, AG (Anything Goes)\n"
+            "National Dex, CAP"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="✨ Features",
+        value=(
+            "• Interactive format selector\n"
+            "• Multiple sets per Pokemon\n"
+            "• Automatic tier detection\n"
+            "• Generation switcher"
         ),
         inline=False,
     )
