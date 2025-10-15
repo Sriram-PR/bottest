@@ -18,6 +18,7 @@ from utils.helpers import (
     format_nature,
     format_tera_type,
     get_format_display_name,
+    get_smogon_url,
     truncate_text,
 )
 
@@ -224,18 +225,30 @@ class Smogon(commands.Cog):
         pokemon_display = capitalize_pokemon_name(pokemon_name)
         format_display = format_generation_tier(generation, tier)
 
+        # Generate Smogon URL
+        smogon_url = get_smogon_url(pokemon_name, generation, tier)
+
         embed = discord.Embed(
             title=f"{pokemon_display} - {set_name}",
             description=f"**Format:** {format_display}",
             color=BOT_COLOR,
+            url=smogon_url,  # Makes title clickable
         )
 
         # Basic info
         level = set_info.get("level", 100)
 
         # Ability
-        ability = format_ability(set_info.get("ability", "Unknown"))
-        embed.add_field(name="Ability", value=ability, inline=True)
+        ability_raw = set_info.get("ability")
+        logger.debug(f"Raw ability data: {ability_raw} (type: {type(ability_raw)})")
+
+        if ability_raw:
+            ability = format_ability(ability_raw)
+            embed.add_field(name="Ability", value=ability, inline=True)
+        else:
+            # Only show if ability is actually specified
+            logger.warning(f"No ability found in set: {set_name}")
+            embed.add_field(name="Ability", value="—", inline=True)
 
         # Item
         item = format_item(set_info.get("item", "None"))
@@ -275,7 +288,7 @@ class Smogon(commands.Cog):
         # Footer with metadata
         set_count = f"Set {current_set_index + 1} of {total_sets}"
         embed.set_footer(
-            text=f"Data from Smogon University • Level {level} • {set_count}"
+            text=f"Click title for full analysis • Level {level} • {set_count}"
         )
 
         return embed

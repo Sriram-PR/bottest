@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional
 
 import discord
 
-from config.settings import FORMAT_NAMES, TYPE_EMOJIS
+from config.settings import FORMAT_NAMES, SMOGON_DEX_GENS, TYPE_EMOJIS
 
 
 def capitalize_pokemon_name(name: str) -> str:
@@ -166,8 +166,16 @@ def format_ability(ability: Any) -> str:
         Formatted ability string
     """
     if isinstance(ability, list):
-        return " / ".join(ability)
-    return str(ability) if ability else "Unknown"
+        # Filter out empty strings
+        abilities = [str(a).strip() for a in ability if a]
+        if abilities:
+            return " / ".join(abilities)
+        return "—"
+
+    if ability:
+        return str(ability).strip()
+
+    return "—"
 
 
 def format_item(item: Any) -> str:
@@ -238,6 +246,33 @@ def truncate_text(text: str, max_length: int = 1024) -> str:
     if len(text) <= max_length:
         return text
     return text[: max_length - 3] + "..."
+
+
+def get_smogon_url(pokemon: str, generation: str, tier: str) -> str:
+    """
+    Generate Smogon Dex URL for a Pokemon set
+
+    Args:
+        pokemon: Pokemon name (e.g., 'garchomp', 'landorus-therian')
+        generation: Generation string (e.g., 'gen9')
+        tier: Tier string (e.g., 'ou', '1v1')
+
+    Returns:
+        Smogon Dex URL (e.g., 'https://www.smogon.com/dex/sv/pokemon/garchomp/ou/')
+    """
+    # Get Smogon generation code
+    gen_code = SMOGON_DEX_GENS.get(generation.lower(), "sv")  # Default to SV
+
+    # Format pokemon name (lowercase, keep hyphens)
+    pokemon_formatted = pokemon.lower().strip().replace(" ", "-")
+
+    # Format tier (lowercase)
+    tier_formatted = tier.lower().strip()
+
+    # Build URL
+    url = f"https://www.smogon.com/dex/{gen_code}/pokemon/{pokemon_formatted}/{tier_formatted}/"
+
+    return url
 
 
 def create_error_embed(

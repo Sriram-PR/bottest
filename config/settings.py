@@ -171,6 +171,19 @@ FORMAT_NAMES = {
     "nfe": "NFE",
 }
 
+# Smogon Dex generation codes
+SMOGON_DEX_GENS = {
+    "gen1": "rb",
+    "gen2": "gs",
+    "gen3": "rs",
+    "gen4": "dp",
+    "gen5": "bw",
+    "gen6": "xy",
+    "gen7": "sm",
+    "gen8": "ss",
+    "gen9": "sv",
+}
+
 # Emoji mappings for types
 TYPE_EMOJIS = {
     "normal": "⭐",

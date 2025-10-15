@@ -42,7 +42,7 @@ async def on_ready():
 
     # Set bot status
     await bot.change_presence(
-        activity=discord.Game(name=f"Pokemon Smogon | {COMMAND_PREFIX}smogon")
+        activity=discord.Game(name=f"Pokemon | {COMMAND_PREFIX}smogon")
     )
 
 
