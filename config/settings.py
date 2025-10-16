@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -9,10 +10,17 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", ".")
 OWNER_ID = int(os.getenv("OWNER_ID", 0))
+TARGET_USER_ID = int(os.getenv("TARGET_USER_ID", 0))
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production")  # production or development
 
 # Validate required settings
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKEN not found in .env file!")
+
+# Data Storage
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)  # Create data directory if it doesn't exist
+SHINY_CHANNELS_FILE = DATA_DIR / "shiny_channels.json"
 
 # API Configuration
 SMOGON_SETS_URL = "https://data.pkmn.cc/sets"
@@ -20,10 +28,36 @@ POKEAPI_URL = "https://pokeapi.co/api/v2"
 
 # Bot Settings
 BOT_COLOR = 0xFF7BA9  # Smogon red
-CACHE_TIMEOUT = 60  # 60 seconds
 MAX_EMBED_FIELDS = 25  # Discord limit
-MAX_CACHE_SIZE = 200  # Maximum cache entries (LRU)
 MAX_GENERATION = 9  # Current maximum generation
+
+# Cache Configuration
+CACHE_TIMEOUT = 60  # 60 seconds
+MAX_CACHE_SIZE = 200  # Maximum cache entries (LRU)
+CACHE_CLEANUP_INTERVAL = 300  # Clean expired cache every 5 minutes
+
+# Rate Limiting
+MAX_CONCURRENT_API_REQUESTS = 5  # Maximum parallel API calls
+API_REQUEST_TIMEOUT = 30  # Seconds before timeout
+
+# Retry Configuration
+MAX_RETRY_ATTEMPTS = 3  # Number of retries for failed API calls
+RETRY_BASE_DELAY = 1  # Base delay for exponential backoff (seconds)
+RETRY_MAX_DELAY = 10  # Maximum retry delay (seconds)
+
+# Command Cooldowns (seconds)
+SMOGON_COMMAND_COOLDOWN = 5
+EFFORTVALUE_COMMAND_COOLDOWN = 3
+SPRITE_COMMAND_COOLDOWN = 3
+DEFAULT_COMMAND_COOLDOWN = 5
+
+# Circuit Breaker Settings
+CIRCUIT_BREAKER_ENABLED = True
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 60  # seconds
+
+# Logging Configuration
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # DEBUG, INFO, WARNING, ERROR
 
 # Generation and Tier Mappings
 GENERATION_MAP = {

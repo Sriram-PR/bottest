@@ -4,7 +4,13 @@ from typing import Dict, Optional
 import discord
 from discord.ext import commands
 
-from config.settings import BOT_COLOR, GENERATION_MAP, MAX_GENERATION, TIER_MAP
+from config.settings import (
+    BOT_COLOR,
+    EFFORTVALUE_COMMAND_COOLDOWN,
+    MAX_GENERATION,
+    SMOGON_COMMAND_COOLDOWN,
+    SPRITE_COMMAND_COOLDOWN,
+)
 from utils.api_clients import SmogonAPIClient
 from utils.helpers import (
     capitalize_pokemon_name,
@@ -20,15 +26,23 @@ from utils.helpers import (
     get_format_display_name,
     get_smogon_url,
     truncate_text,
+    validate_and_truncate_embed,
+)
+from utils.validators import (
+    sanitize_input,
+    validate_generation,
+    validate_pokemon_name,
+    validate_shiny_generation,
+    validate_tier,
 )
 
 logger = logging.getLogger("smogon_bot.smogon")
 
 
 class Smogon(commands.Cog):
-    """Cog for fetching Smogon competitive sets"""
+    """Cog for fetching Smogon competitive sets and Pokemon data"""
 
-    def __init__(self, bot):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.api_client = SmogonAPIClient()
 
@@ -42,6 +56,7 @@ class Smogon(commands.Cog):
         description="Get competitive movesets from Smogon University",
         aliases=["comp", "set", "sets"],
     )
+    @commands.cooldown(1, SMOGON_COMMAND_COOLDOWN, commands.BucketType.user)
     async def smogon(
         self,
         ctx: commands.Context,
@@ -80,29 +95,31 @@ class Smogon(commands.Cog):
         generation: str,
         tier: Optional[str],
     ):
-        """Process the smogon command logic"""
-        # Normalize generation
-        gen_input = generation.lower().strip() if generation else "gen9"
-        gen_normalized = GENERATION_MAP.get(gen_input, gen_input)
+        """Process the smogon command logic with validation"""
 
-        # Validate generation
-        if (
-            not gen_normalized.startswith("gen")
-            or gen_normalized not in GENERATION_MAP.values()
-        ):
-            embed = create_error_embed(
-                "Invalid Generation",
-                f"Generation `{generation}` is not valid.\n"
-                f"Use: gen1, gen2, gen3, gen4, gen5, gen6, gen7, gen8, or gen9",
-            )
+        # Sanitize and validate pokemon name
+        pokemon = sanitize_input(pokemon)
+        is_valid, error_msg = validate_pokemon_name(pokemon)
+        if not is_valid:
+            embed = create_error_embed("Invalid Pokemon Name", error_msg)
+            await ctx.send(embed=embed)
+            return
+
+        # Validate and normalize generation
+        is_valid, error_msg, gen_normalized = validate_generation(generation)
+        if not is_valid:
+            embed = create_error_embed("Invalid Generation", error_msg)
             await ctx.send(embed=embed)
             return
 
         # Normalize tier if provided
         tier_normalized = None
         if tier:
-            tier_input = tier.lower().strip()
-            tier_normalized = TIER_MAP.get(tier_input, tier_input)
+            is_valid, error_msg, tier_normalized = validate_tier(tier)
+            if not is_valid:
+                embed = create_error_embed("Invalid Tier", error_msg)
+                await ctx.send(embed=embed)
+                return
 
         # If tier is specified, fetch only that tier
         if tier_normalized:
@@ -129,10 +146,11 @@ class Smogon(commands.Cog):
                 all_formats = {tier_normalized: sets_data}
 
             except Exception as e:
-                logger.error(f"Error fetching {tier_normalized}: {e}")
+                logger.error(f"Error fetching {tier_normalized}: {e}", exc_info=True)
                 embed = create_error_embed(
                     "Error",
-                    f"Failed to fetch data for **{tier_normalized.upper()}**. The tier may not exist.",
+                    f"Failed to fetch data for **{tier_normalized.upper()}**. "
+                    f"The tier may not exist or the service is temporarily unavailable.",
                 )
                 await ctx.send(embed=embed)
                 return
@@ -161,7 +179,8 @@ class Smogon(commands.Cog):
                 logger.error(f"Error searching formats: {e}", exc_info=True)
                 embed = create_error_embed(
                     "Error",
-                    "An error occurred while searching for the Pokemon. Please try again.",
+                    "An error occurred while searching for the Pokemon. "
+                    "The service may be temporarily unavailable. Please try again later.",
                 )
                 await ctx.send(embed=embed)
                 return
@@ -190,6 +209,7 @@ class Smogon(commands.Cog):
             current_format=first_format,
             api_client=self.api_client,
             cog=self,
+            author_id=ctx.author.id,
             timeout=180,
         )
 
@@ -202,6 +222,7 @@ class Smogon(commands.Cog):
         description="Get EV yield when defeating a Pokemon",
         aliases=["ev", "evyield", "yield"],
     )
+    @commands.cooldown(1, EFFORTVALUE_COMMAND_COOLDOWN, commands.BucketType.user)
     async def effortvalue(self, ctx: commands.Context, pokemon: str):
         """
         Get the effort values (EVs) a Pokemon yields when defeated
@@ -225,7 +246,16 @@ class Smogon(commands.Cog):
         await self._process_ev_command(ctx, pokemon)
 
     async def _process_ev_command(self, ctx: commands.Context, pokemon: str):
-        """Process the EV yield command logic"""
+        """Process the EV yield command logic with validation"""
+
+        # Sanitize and validate pokemon name
+        pokemon = sanitize_input(pokemon)
+        is_valid, error_msg = validate_pokemon_name(pokemon)
+        if not is_valid:
+            embed = create_error_embed("Invalid Pokemon Name", error_msg)
+            await ctx.send(embed=embed)
+            return
+
         try:
             ev_data = await self.api_client.get_pokemon_ev_yield(pokemon)
 
@@ -249,7 +279,8 @@ class Smogon(commands.Cog):
             logger.error(f"Error in EV command: {e}", exc_info=True)
             embed = create_error_embed(
                 "Error",
-                "An error occurred while fetching EV yield data. Please try again.",
+                "An error occurred while fetching EV yield data. "
+                "The service may be temporarily unavailable. Please try again later.",
             )
             await ctx.send(embed=embed)
 
@@ -288,14 +319,14 @@ class Smogon(commands.Cog):
         else:
             ev_string = "No EVs"
 
-        # Create embed with Pokemon name as title, EV yield as description
+        # Create embed
         embed = discord.Embed(
             title=pokemon_display,
             description=ev_string,
             color=BOT_COLOR,
         )
 
-        # Add sprite if available (no URL = not clickable)
+        # Add sprite if available
         if ev_data.get("sprite"):
             embed.set_thumbnail(url=ev_data["sprite"])
 
@@ -306,6 +337,7 @@ class Smogon(commands.Cog):
         description="Get a Pokemon sprite image",
         aliases=["img", "image", "pic"],
     )
+    @commands.cooldown(1, SPRITE_COMMAND_COOLDOWN, commands.BucketType.user)
     async def sprite(
         self,
         ctx: commands.Context,
@@ -340,27 +372,23 @@ class Smogon(commands.Cog):
     async def _process_sprite_command(
         self, ctx: commands.Context, pokemon: str, shiny: str, generation: int
     ):
-        """Process the sprite command logic"""
-        # Parse shiny parameter
-        shiny_bool = shiny.lower() in ["yes", "y", "true", "1", "shiny"]
+        """Process the sprite command logic with validation"""
 
-        # Validate generation
-        if generation < 1 or generation > 9:
-            embed = create_error_embed(
-                "Invalid Generation",
-                f"Generation must be between 1 and 9. You provided: {generation}",
-            )
+        # Sanitize and validate pokemon name
+        pokemon = sanitize_input(pokemon)
+        is_valid, error_msg = validate_pokemon_name(pokemon)
+        if not is_valid:
+            embed = create_error_embed("Invalid Pokemon Name", error_msg)
             await ctx.send(embed=embed)
             return
 
-        # Validate shiny + generation (shinies introduced in Gen 2)
-        if shiny_bool and generation == 1:
-            embed = create_error_embed(
-                "Shiny Not Available",
-                f"Shiny Pokemon were introduced in **Generation 2**.\n\n"
-                f"Generation 1 games (Red/Blue/Yellow) did not have shiny Pokemon.\n\n"
-                f"Try `/sprite {pokemon} yes 2` or higher for shiny sprites.",
-            )
+        # Parse shiny parameter
+        shiny_bool = shiny.lower() in ["yes", "y", "true", "1", "shiny"]
+
+        # Validate shiny + generation combination
+        is_valid, error_msg = validate_shiny_generation(shiny_bool, generation)
+        if not is_valid:
+            embed = create_error_embed("Invalid Request", error_msg)
             await ctx.send(embed=embed)
             return
 
@@ -402,7 +430,9 @@ class Smogon(commands.Cog):
         except Exception as e:
             logger.error(f"Error in sprite command: {e}", exc_info=True)
             embed = create_error_embed(
-                "Error", "An error occurred while fetching sprite. Please try again."
+                "Error",
+                "An error occurred while fetching sprite. "
+                "The service may be temporarily unavailable. Please try again later.",
             )
             await ctx.send(embed=embed)
 
@@ -423,7 +453,7 @@ class Smogon(commands.Cog):
 
         # Build title with shiny indicator
         if sprite_data.get("shiny", False):
-            title = f"✨ {pokemon_display} (Shiny)"
+            title = f"​​★ {pokemon_display}"
         else:
             title = pokemon_display
 
@@ -459,6 +489,7 @@ class Smogon(commands.Cog):
         embed = discord.Embed(
             title="Pokemon Showdown Damage Calculator",
             url="https://calc.pokemonshowdown.com/",
+            description="Click the title to open the calculator!",
             color=BOT_COLOR,
         )
 
@@ -495,11 +526,14 @@ class Smogon(commands.Cog):
         # Generate Smogon URL
         smogon_url = get_smogon_url(pokemon_name, generation, tier)
 
+        # Truncate set name if needed
+        display_set_name = truncate_text(set_name, 200, smart=True)
+
         embed = discord.Embed(
-            title=f"{pokemon_display} - {set_name}",
+            title=truncate_text(f"{pokemon_display} - {display_set_name}", 256),
             description=f"**Format:** {format_display}",
             color=BOT_COLOR,
-            url=smogon_url,  # Makes title clickable
+            url=smogon_url,
         )
 
         # Basic info
@@ -507,14 +541,10 @@ class Smogon(commands.Cog):
 
         # Ability
         ability_raw = set_info.get("ability")
-        logger.debug(f"Raw ability data: {ability_raw} (type: {type(ability_raw)})")
-
         if ability_raw:
             ability = format_ability(ability_raw)
             embed.add_field(name="Ability", value=ability, inline=True)
         else:
-            # Only show if ability is actually specified
-            logger.warning(f"No ability found in set: {set_name}")
             embed.add_field(name="Ability", value="—", inline=True)
 
         # Item
@@ -558,17 +588,21 @@ class Smogon(commands.Cog):
             text=f"Click title for full analysis • Level {level} • {set_count}"
         )
 
+        # Validate and truncate if needed
+        embed = validate_and_truncate_embed(embed)
+
         return embed
 
 
 class SetSelectorView(discord.ui.View):
     """
-    View with dropdowns for generation, format, and set selection
+    Interactive view with dropdowns for generation, format, and set selection
 
     Features:
     - Generation selector (Gen 1-9)
     - Format selector (shows only formats where Pokemon exists)
     - Set selector (shows all sets in selected format, warns if >25)
+    - Author-only interaction (prevents others from using buttons)
     """
 
     def __init__(
@@ -577,17 +611,19 @@ class SetSelectorView(discord.ui.View):
         all_formats: Dict[str, dict],
         generation: str,
         current_format: str,
-        api_client,
-        cog,
+        api_client: SmogonAPIClient,
+        cog: Smogon,
+        author_id: int,
         timeout: int = 180,
     ):
         super().__init__(timeout=timeout)
         self.pokemon = pokemon
-        self.all_formats = all_formats  # {tier: {set_name: set_data}}
+        self.all_formats = all_formats
         self.generation = generation
         self.current_format = current_format
         self.api_client = api_client
         self.cog = cog
+        self.author_id = author_id
         self.current_set_index = 0
         self.message: Optional[discord.Message] = None
 
@@ -595,6 +631,23 @@ class SetSelectorView(discord.ui.View):
         self.add_generation_selector()
         self.add_format_selector()
         self.add_set_selector()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """
+        Check if the user interacting is the command author
+
+        Args:
+            interaction: Discord interaction
+
+        Returns:
+            True if user is authorized, False otherwise
+        """
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the command author can use these buttons!", ephemeral=True
+            )
+            return False
+        return True
 
     def add_generation_selector(self):
         """Add generation selector dropdown"""
@@ -628,7 +681,7 @@ class SetSelectorView(discord.ui.View):
 
             options.append(
                 discord.SelectOption(
-                    label=display_name[:100],  # Discord limit
+                    label=display_name[:100],
                     value=tier,
                     emoji="⚔️",
                     default=(tier == self.current_format),
@@ -656,7 +709,7 @@ class SetSelectorView(discord.ui.View):
         for idx, set_name in enumerate(display_sets):
             options.append(
                 discord.SelectOption(
-                    label=set_name[:100],  # Discord limit
+                    label=set_name[:100],
                     value=str(idx),
                     description=f"View {set_name}"[:100],
                     emoji="⚔️",
@@ -680,7 +733,12 @@ class SetSelectorView(discord.ui.View):
         self.add_item(select)
 
     async def generation_callback(self, interaction: discord.Interaction):
-        """Handle generation selection"""
+        """
+        Handle generation dropdown selection
+
+        Fetches all formats for the new generation and updates the view.
+        Shows error if Pokemon not found in selected generation.
+        """
         selected_gen = interaction.data["values"][0]
 
         await interaction.response.defer()
@@ -738,7 +796,11 @@ class SetSelectorView(discord.ui.View):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def format_callback(self, interaction: discord.Interaction):
-        """Handle format selection"""
+        """
+        Handle format dropdown selection
+
+        Switches to the selected format and displays the first set.
+        """
         selected_format = interaction.data["values"][0]
         self.current_format = selected_format
         self.current_set_index = 0
@@ -767,7 +829,11 @@ class SetSelectorView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def set_callback(self, interaction: discord.Interaction):
-        """Handle set selection"""
+        """
+        Handle set dropdown selection
+
+        Displays the selected moveset.
+        """
         selected_index = int(interaction.data["values"][0])
         self.current_set_index = selected_index
 
@@ -801,11 +867,15 @@ class SetSelectorView(discord.ui.View):
             try:
                 await self.message.edit(view=None)
                 logger.info("View timed out, buttons removed")
-            except Exception as e:
+            except discord.NotFound:
+                logger.debug("Message was deleted before timeout")
+            except discord.HTTPException as e:
                 logger.error(f"Error removing buttons on timeout: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error in on_timeout: {e}")
 
 
-async def setup(bot):
+async def setup(bot: commands.Bot):
     """Setup function to add cog to bot"""
     await bot.add_cog(Smogon(bot))
     logger.info("Smogon cog loaded successfully")

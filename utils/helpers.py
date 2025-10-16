@@ -3,6 +3,11 @@ from typing import Any, Dict, List, Optional
 import discord
 
 from config.settings import FORMAT_NAMES, SMOGON_DEX_GENS, TYPE_EMOJIS
+from utils.constants import (
+    DISCORD_EMBED_DESCRIPTION_LIMIT,
+    DISCORD_EMBED_TITLE_LIMIT,
+    DISCORD_EMBED_TOTAL_LIMIT,
+)
 
 
 def capitalize_pokemon_name(name: str) -> str:
@@ -232,19 +237,28 @@ def format_tera_type(tera: Any) -> Optional[str]:
         return f"{emoji} {tera}"
 
 
-def truncate_text(text: str, max_length: int = 1024) -> str:
+def truncate_text(text: str, max_length: int = 1024, smart: bool = True) -> str:
     """
     Truncate text to fit Discord embed field limits
 
     Args:
         text: Text to truncate
         max_length: Maximum length (default 1024 for embed fields)
+        smart: If True, try to truncate at word boundaries
 
     Returns:
         Truncated text with ellipsis if needed
     """
     if len(text) <= max_length:
         return text
+
+    if smart:
+        # Try to truncate at last space before max_length
+        truncate_point = text.rfind(" ", 0, max_length - 3)
+        if truncate_point > max_length // 2:  # Only if we find a space in latter half
+            return text[:truncate_point] + "..."
+
+    # Fallback to hard truncate
     return text[: max_length - 3] + "..."
 
 
@@ -258,7 +272,7 @@ def get_smogon_url(pokemon: str, generation: str, tier: str) -> str:
         tier: Tier string (e.g., 'ou', '1v1')
 
     Returns:
-        Smogon Dex URL (e.g., 'https://www.smogon.com/dex/sv/pokemon/garchomp/ou/')
+        Smogon Dex URL
     """
     # Get Smogon generation code
     gen_code = SMOGON_DEX_GENS.get(generation.lower(), "sv")  # Default to SV
@@ -289,5 +303,56 @@ def create_error_embed(
     Returns:
         Discord embed
     """
-    embed = discord.Embed(title=f"❌ {title}", description=description, color=color)
+    embed = discord.Embed(
+        title=f"❌ {title}",
+        description=truncate_text(description, DISCORD_EMBED_DESCRIPTION_LIMIT),
+        color=color,
+    )
+    return embed
+
+
+def validate_and_truncate_embed(embed: discord.Embed) -> discord.Embed:
+    """
+    Validate and truncate embed to fit within Discord limits
+
+    Args:
+        embed: Discord embed to validate
+
+    Returns:
+        Modified embed that fits within limits
+    """
+    # Truncate title if needed
+    if embed.title and len(embed.title) > DISCORD_EMBED_TITLE_LIMIT:
+        embed.title = embed.title[: DISCORD_EMBED_TITLE_LIMIT - 3] + "..."
+
+    # Truncate description if needed
+    if embed.description and len(embed.description) > DISCORD_EMBED_DESCRIPTION_LIMIT:
+        embed.description = truncate_text(
+            embed.description, DISCORD_EMBED_DESCRIPTION_LIMIT
+        )
+
+    # Check total character count
+    total_chars = 0
+    if embed.title:
+        total_chars += len(embed.title)
+    if embed.description:
+        total_chars += len(embed.description)
+    if embed.footer.text:
+        total_chars += len(embed.footer.text)
+    if embed.author.name:
+        total_chars += len(embed.author.name)
+
+    for field in embed.fields:
+        total_chars += len(field.name) + len(field.value)
+
+    # If over limit, we need to remove some fields
+    if total_chars > DISCORD_EMBED_TOTAL_LIMIT:
+        # Calculate how much we need to remove
+        excess = total_chars - DISCORD_EMBED_TOTAL_LIMIT
+
+        # Try to truncate the description first
+        if embed.description and len(embed.description) > excess:
+            new_desc_length = max(100, len(embed.description) - excess - 50)
+            embed.description = truncate_text(embed.description, new_desc_length)
+
     return embed
