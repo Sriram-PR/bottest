@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -6,16 +7,55 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Bot Configuration
+# Setup logger for configuration warnings
+logger = logging.getLogger("smogon_bot.config")
+
+# Bot Configuration - Required
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    raise ValueError(
+        "❌ DISCORD_TOKEN not found in .env file! Please add it to continue."
+    )
+
+# Bot Configuration - Optional
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", ".")
-OWNER_ID = int(os.getenv("OWNER_ID", 0))
-TARGET_USER_ID = int(os.getenv("TARGET_USER_ID", 0))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")  # production or development
 
-# Validate required settings
-if not DISCORD_TOKEN:
-    raise ValueError("DISCORD_TOKEN not found in .env file!")
+# Owner ID (for admin commands)
+OWNER_ID = os.getenv("OWNER_ID")
+if OWNER_ID:
+    try:
+        OWNER_ID = int(OWNER_ID)
+    except ValueError:
+        raise ValueError("❌ OWNER_ID must be a valid integer!")
+else:
+    OWNER_ID = 0
+    logger.warning(
+        "⚠️  OWNER_ID not set - admin commands (/uptime, /shiny-channel) will be unavailable"
+    )
+
+# Target User ID (for shiny monitoring)
+TARGET_USER_ID = os.getenv("TARGET_USER_ID")
+if TARGET_USER_ID:
+    try:
+        TARGET_USER_ID = int(TARGET_USER_ID)
+    except ValueError:
+        raise ValueError("❌ TARGET_USER_ID must be a valid integer!")
+else:
+    TARGET_USER_ID = 0
+    logger.warning("⚠️  TARGET_USER_ID not set - shiny monitoring will be disabled")
+
+# Shiny Notification Configuration
+SHINY_NOTIFICATION_ENABLED = TARGET_USER_ID != 0
+
+# Customizable shiny notification message
+SHINY_NOTIFICATION_MESSAGE = os.getenv(
+    "SHINY_NOTIFICATION_MESSAGE",
+    "🌟 **SHINY POKEMON DETECTED!** 🌟\nA wild shiny has appeared!",
+)
+
+# Optional role to ping when shiny is found (role ID as string)
+SHINY_NOTIFICATION_PING_ROLE = os.getenv("SHINY_NOTIFICATION_PING_ROLE", "")
 
 # Data Storage
 DATA_DIR = Path("data")
@@ -35,6 +75,7 @@ MAX_GENERATION = 9  # Current maximum generation
 CACHE_TIMEOUT = 60  # 60 seconds
 MAX_CACHE_SIZE = 200  # Maximum cache entries (LRU)
 CACHE_CLEANUP_INTERVAL = 300  # Clean expired cache every 5 minutes
+CACHE_PERSIST_TO_DISK = True  # Enable disk persistence for cache
 
 # Rate Limiting
 MAX_CONCURRENT_API_REQUESTS = 5  # Maximum parallel API calls

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from typing import Optional, Set
@@ -14,6 +15,8 @@ from config.settings import (
     LOG_LEVEL,
     OWNER_ID,
     SHINY_CHANNELS_FILE,
+    SHINY_NOTIFICATION_MESSAGE,
+    SHINY_NOTIFICATION_PING_ROLE,
     TARGET_USER_ID,
 )
 
@@ -32,6 +35,9 @@ logger = logging.getLogger("smogon_bot")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
+
+# Shiny detection pattern - more robust than hardcoded Unicode
+SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*★")
 
 
 class SmogonBot(commands.Bot):
@@ -135,39 +141,57 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
-    # Check if message is from target user
-    if TARGET_USER_ID and message.author.id == TARGET_USER_ID:
-        # Check if message has embeds
-        if message.embeds:
-            first_embed = message.embeds[0]
+    # Wrap shiny detection in try-except to prevent bot crashes
+    try:
+        # Check if message is from target user
+        if TARGET_USER_ID and message.author.id == TARGET_USER_ID:
+            # Check if message has embeds
+            if message.embeds:
+                first_embed = message.embeds[0]
 
-            # Check if embed has a title and contains "Vs. ★" (case-strict)
-            if first_embed.title and "Vs.​ ​ ​​★" in first_embed.title:
-                logger.info(f"Shiny detected! Embed title: {first_embed.title}")
+                # Use regex pattern for more robust matching
+                if first_embed.title and SHINY_PATTERN.search(first_embed.title):
+                    logger.info(f"✨ Shiny detected! Embed title: {first_embed.title}")
 
-                # Post notification in all configured channels
-                notification_message = (
-                    "a shiny found\na shiny found\na shiny found\na shiny found"
-                )
+                    # Build notification message from config
+                    notification_message = SHINY_NOTIFICATION_MESSAGE
 
-                for channel_id in bot.shiny_channels:
-                    try:
-                        channel = bot.get_channel(channel_id)
-                        if channel:
-                            await channel.send(notification_message)
-                            logger.info(
-                                f"Posted shiny notification to channel: {channel.name} ({channel_id})"
+                    # Add role ping if configured
+                    if SHINY_NOTIFICATION_PING_ROLE:
+                        notification_message = f"<@&{SHINY_NOTIFICATION_PING_ROLE}>\n{notification_message}"
+
+                    # Post notification in all configured channels
+                    for channel_id in bot.shiny_channels:
+                        try:
+                            channel = bot.get_channel(channel_id)
+                            if channel:
+                                await channel.send(notification_message)
+                                logger.info(
+                                    f"Posted shiny notification to channel: {channel.name} ({channel_id})"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Channel {channel_id} not found (may have been deleted)"
+                                )
+                        except discord.Forbidden:
+                            logger.error(
+                                f"No permission to send in channel {channel_id}"
                             )
-                        else:
-                            logger.warning(
-                                f"Channel {channel_id} not found (may have been deleted)"
+                        except discord.HTTPException as e:
+                            logger.error(
+                                f"HTTP error sending to channel {channel_id}: {e}"
                             )
-                    except discord.Forbidden:
-                        logger.error(f"No permission to send in channel {channel_id}")
-                    except Exception as e:
-                        logger.error(f"Error sending to channel {channel_id}: {e}")
+                        except Exception as e:
+                            logger.error(
+                                f"Unexpected error sending to channel {channel_id}: {e}",
+                                exc_info=True,
+                            )
 
-    # Process commands
+    except Exception as e:
+        # Log error but don't crash the bot
+        logger.error(f"Error in shiny detection: {e}", exc_info=True)
+
+    # ALWAYS process commands, even if shiny detection fails
     await bot.process_commands(message)
 
 

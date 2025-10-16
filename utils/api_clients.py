@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import pickle
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
@@ -9,7 +11,9 @@ import aiohttp
 from config.settings import (
     API_REQUEST_TIMEOUT,
     CACHE_CLEANUP_INTERVAL,
+    CACHE_PERSIST_TO_DISK,
     CACHE_TIMEOUT,
+    DATA_DIR,
     FORMATS_BY_GEN,
     MAX_CACHE_SIZE,
     MAX_CONCURRENT_API_REQUESTS,
@@ -28,6 +32,7 @@ class SmogonAPIClient:
 
     Features:
     - LRU cache with size limit and auto-cleanup
+    - Disk-based cache persistence across restarts
     - Rate limiting with semaphore
     - Automatic retry on failures
     - Parallel format fetching
@@ -52,6 +57,64 @@ class SmogonAPIClient:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._is_closing = False
 
+        # Load cache from disk on initialization
+        if CACHE_PERSIST_TO_DISK:
+            self._load_cache_from_disk()
+
+    def _get_cache_file(self) -> Path:
+        """Get cache file path"""
+        return DATA_DIR / "api_cache.pkl"
+
+    def _load_cache_from_disk(self):
+        """Load cache from disk if available"""
+        cache_file = self._get_cache_file()
+        if not cache_file.exists():
+            logger.info("No existing cache file found - starting with empty cache")
+            return
+
+        try:
+            with open(cache_file, "rb") as f:
+                loaded_cache = pickle.load(f)
+
+            # Only load non-expired entries
+            current_time = time.time()
+            valid_entries = 0
+            expired_entries = 0
+
+            for key, (data, timestamp) in loaded_cache.items():
+                if current_time - timestamp < CACHE_TIMEOUT:
+                    self.cache[key] = (data, timestamp)
+                    valid_entries += 1
+                else:
+                    expired_entries += 1
+
+            logger.info(
+                f"✅ Loaded {valid_entries} valid cache entries from disk "
+                f"({expired_entries} expired entries discarded)"
+            )
+        except Exception as e:
+            logger.error(f"❌ Error loading cache from disk: {e}")
+            logger.info("Starting with empty cache")
+
+    def _save_cache_to_disk(self):
+        """Save cache to disk"""
+        if not CACHE_PERSIST_TO_DISK:
+            return
+
+        cache_file = self._get_cache_file()
+
+        try:
+            # Ensure data directory exists
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Save cache to disk
+            with open(cache_file, "wb") as f:
+                pickle.dump(dict(self.cache), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            logger.info(f"💾 Saved {len(self.cache)} cache entries to disk")
+        except Exception as e:
+            logger.error(f"❌ Error saving cache to disk: {e}")
+
     async def get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session with timeout configuration"""
         if self.session is None or self.session.closed:
@@ -71,6 +134,10 @@ class SmogonAPIClient:
     async def close(self):
         """Close the aiohttp session and cleanup tasks"""
         self._is_closing = True
+
+        # Save cache to disk before closing
+        if CACHE_PERSIST_TO_DISK:
+            self._save_cache_to_disk()
 
         # Cancel cleanup task
         if self._cleanup_task and not self._cleanup_task.done():
