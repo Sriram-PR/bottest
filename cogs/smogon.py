@@ -197,6 +197,273 @@ class Smogon(commands.Cog):
         message = await ctx.send(embed=embed, view=view)
         view.message = message
 
+    @commands.hybrid_command(
+        name="effortvalue",
+        description="Get EV yield when defeating a Pokemon",
+        aliases=["ev", "evyield", "yield"],
+    )
+    async def effortvalue(self, ctx: commands.Context, pokemon: str):
+        """
+        Get the effort values (EVs) a Pokemon yields when defeated
+
+        Args:
+            pokemon: Pokemon name (e.g., garchomp, landorus-therian)
+
+        Examples:
+            .effortvalue garchomp
+            .ev blissey
+            /effortvalue chansey
+        """
+        # Defer response for slash commands
+        if ctx.interaction:
+            await ctx.defer()
+        else:
+            async with ctx.typing():
+                await self._process_ev_command(ctx, pokemon)
+                return
+
+        await self._process_ev_command(ctx, pokemon)
+
+    async def _process_ev_command(self, ctx: commands.Context, pokemon: str):
+        """Process the EV yield command logic"""
+        try:
+            ev_data = await self.api_client.get_pokemon_ev_yield(pokemon)
+
+            if not ev_data:
+                embed = create_error_embed(
+                    "Pokemon Not Found",
+                    f"Could not find EV yield data for **{capitalize_pokemon_name(pokemon)}**.\n\n"
+                    f"**Suggestions:**\n"
+                    f"• Check spelling\n"
+                    f"• Use hyphens for forms: `landorus-therian`\n"
+                    f"• Try the base form without regional variants",
+                )
+                await ctx.send(embed=embed)
+                return
+
+            # Create embed
+            embed = self.create_ev_embed(pokemon, ev_data)
+            await ctx.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in EV command: {e}", exc_info=True)
+            embed = create_error_embed(
+                "Error",
+                "An error occurred while fetching EV yield data. Please try again.",
+            )
+            await ctx.send(embed=embed)
+
+    def create_ev_embed(self, pokemon_name: str, ev_data: dict) -> discord.Embed:
+        """
+        Create Discord embed for EV yield
+
+        Args:
+            pokemon_name: Pokemon name
+            ev_data: EV yield data from PokeAPI
+
+        Returns:
+            Discord embed
+        """
+        pokemon_display = capitalize_pokemon_name(pokemon_name)
+        ev_yields = ev_data["ev_yields"]
+
+        # Build EV yield string
+        ev_parts = []
+        stat_abbrev = {
+            "hp": "HP",
+            "attack": "Atk",
+            "defense": "Def",
+            "special-attack": "SpA",
+            "special-defense": "SpD",
+            "speed": "Spe",
+        }
+
+        for stat_key, stat_short in stat_abbrev.items():
+            effort = ev_yields.get(stat_key, 0)
+            if effort > 0:
+                ev_parts.append(f"+{effort} {stat_short}")
+
+        if ev_parts:
+            ev_string = ", ".join(ev_parts)
+        else:
+            ev_string = "No EVs"
+
+        # Create embed with Pokemon name as title, EV yield as description
+        embed = discord.Embed(
+            title=pokemon_display,
+            description=ev_string,
+            color=BOT_COLOR,
+        )
+
+        # Add sprite if available (no URL = not clickable)
+        if ev_data.get("sprite"):
+            embed.set_thumbnail(url=ev_data["sprite"])
+
+        return embed
+
+    @commands.hybrid_command(
+        name="sprite",
+        description="Get a Pokemon sprite image",
+        aliases=["img", "image", "pic"],
+    )
+    async def sprite(
+        self,
+        ctx: commands.Context,
+        pokemon: str,
+        shiny: str = "no",
+        generation: int = 9,
+    ):
+        """
+        Get a Pokemon sprite image
+
+        Args:
+            pokemon: Pokemon name (e.g., garchomp, landorus-therian)
+            shiny: Show shiny sprite - "yes" or "no" (default: no)
+            generation: Generation 1-9 (default: 9)
+
+        Examples:
+            .sprite garchomp
+            .sprite charizard yes
+            .sprite pikachu no 1
+            /sprite mewtwo yes 1
+        """
+        # Defer response for slash commands
+        if ctx.interaction:
+            await ctx.defer()
+        else:
+            async with ctx.typing():
+                await self._process_sprite_command(ctx, pokemon, shiny, generation)
+                return
+
+        await self._process_sprite_command(ctx, pokemon, shiny, generation)
+
+    async def _process_sprite_command(
+        self, ctx: commands.Context, pokemon: str, shiny: str, generation: int
+    ):
+        """Process the sprite command logic"""
+        # Parse shiny parameter
+        shiny_bool = shiny.lower() in ["yes", "y", "true", "1", "shiny"]
+
+        # Validate generation
+        if generation < 1 or generation > 9:
+            embed = create_error_embed(
+                "Invalid Generation",
+                f"Generation must be between 1 and 9. You provided: {generation}",
+            )
+            await ctx.send(embed=embed)
+            return
+
+        # Validate shiny + generation (shinies introduced in Gen 2)
+        if shiny_bool and generation == 1:
+            embed = create_error_embed(
+                "Shiny Not Available",
+                f"Shiny Pokemon were introduced in **Generation 2**.\n\n"
+                f"Generation 1 games (Red/Blue/Yellow) did not have shiny Pokemon.\n\n"
+                f"Try `/sprite {pokemon} yes 2` or higher for shiny sprites.",
+            )
+            await ctx.send(embed=embed)
+            return
+
+        try:
+            sprite_data = await self.api_client.get_pokemon_sprite(
+                pokemon, shiny_bool, generation
+            )
+
+            if not sprite_data:
+                embed = create_error_embed(
+                    "Sprite Not Found",
+                    f"Could not find sprite for **{capitalize_pokemon_name(pokemon)}**.\n\n"
+                    f"**Suggestions:**\n"
+                    f"• Check spelling\n"
+                    f"• Use hyphens for forms: `landorus-therian`\n"
+                    f"• Some Pokemon may not have sprites for older generations",
+                )
+                await ctx.send(embed=embed)
+                return
+
+            # Check if Pokemon didn't exist in that generation
+            if sprite_data.get("error") == "pokemon_not_in_generation":
+                introduced_gen = sprite_data.get("introduced_gen")
+                requested_gen = sprite_data.get("requested_gen")
+
+                embed = create_error_embed(
+                    "Pokemon Not Available",
+                    f"**{capitalize_pokemon_name(pokemon)}** was introduced in **Generation {introduced_gen}**.\n\n"
+                    f"It did not exist in Generation {requested_gen}.\n\n"
+                    f"Try `/sprite {pokemon} {shiny} {introduced_gen}` or higher.",
+                )
+                await ctx.send(embed=embed)
+                return
+
+            # Create embed
+            embed = self.create_sprite_embed(pokemon, sprite_data)
+            await ctx.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in sprite command: {e}", exc_info=True)
+            embed = create_error_embed(
+                "Error", "An error occurred while fetching sprite. Please try again."
+            )
+            await ctx.send(embed=embed)
+
+    def create_sprite_embed(
+        self, pokemon_name: str, sprite_data: dict
+    ) -> discord.Embed:
+        """
+        Create Discord embed for Pokemon sprite
+
+        Args:
+            pokemon_name: Pokemon name
+            sprite_data: Sprite data from PokeAPI
+
+        Returns:
+            Discord embed
+        """
+        pokemon_display = capitalize_pokemon_name(pokemon_name)
+
+        # Build title with shiny indicator
+        if sprite_data.get("shiny", False):
+            title = f"✨ {pokemon_display} (Shiny)"
+        else:
+            title = pokemon_display
+
+        # Add generation info
+        gen_text = f"Generation {sprite_data.get('generation', 9)}"
+
+        # Create embed with sprite as image
+        embed = discord.Embed(
+            title=title,
+            description=gen_text,
+            color=BOT_COLOR,
+        )
+
+        # Set the sprite as the main image (larger display)
+        if sprite_data.get("sprite_url"):
+            embed.set_image(url=sprite_data["sprite_url"])
+
+        return embed
+
+    @commands.hybrid_command(
+        name="dmgcalc",
+        description="Get link to Showdown damage calculator",
+        aliases=["calc", "damagecalc", "calculator"],
+    )
+    async def dmgcalc(self, ctx: commands.Context):
+        """
+        Get link to Pokemon Showdown damage calculator
+
+        Examples:
+            .dmgcalc
+            /dmgcalc
+        """
+        embed = discord.Embed(
+            title="Pokemon Showdown Damage Calculator",
+            url="https://calc.pokemonshowdown.com/",
+            color=BOT_COLOR,
+        )
+
+        await ctx.send(embed=embed)
+
     def create_set_embed(
         self,
         pokemon_name: str,

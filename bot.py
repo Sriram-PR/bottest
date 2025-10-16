@@ -42,7 +42,7 @@ async def on_ready():
 
     # Set bot status
     await bot.change_presence(
-        activity=discord.Game(name=f"Pokemon | {COMMAND_PREFIX}smogon")
+        activity=discord.Game(name=f"Pokemon Smogon | {COMMAND_PREFIX}smogon")
     )
 
 
@@ -112,21 +112,27 @@ async def help_command(ctx):
     embed = discord.Embed(
         title="🎮 Pokemon Smogon Bot - Help",
         description="Get competitive Pokemon movesets from Smogon University",
-        color=0xE62129,
+        color=0xFF7BA9,
     )
 
     embed.add_field(
         name="📖 Command Usage",
         value=(
             f"**Slash Command:**\n"
-            f"`/smogon <pokemon> [generation] [tier]`\n\n"
+            f"`/smogon <pokemon> [generation] [tier]`\n"
+            f"`/effortvalue <pokemon>`\n"
+            f"`/sprite <pokemon> [shiny] [generation]`\n"
+            f"`/dmgcalc`\n\n"
             f"**Prefix Command:**\n"
-            f"`{COMMAND_PREFIX}smogon <pokemon> [generation] [tier]`\n\n"
+            f"`{COMMAND_PREFIX}smogon <pokemon> [generation] [tier]`\n"
+            f"`{COMMAND_PREFIX}effortvalue <pokemon>`\n"
+            f"`{COMMAND_PREFIX}sprite <pokemon> [shiny] [generation]`\n"
+            f"`{COMMAND_PREFIX}dmgcalc`\n\n"
             f"**Examples:**\n"
             f"`/smogon garchomp`\n"
-            f"`/smogon landorus-therian gen8`\n"
-            f"`/smogon charizard gen7 uu`\n"
-            f"`{COMMAND_PREFIX}smogon garchomp gen9 ou`"
+            f"`/effortvalue blissey`\n"
+            f"`/sprite charizard yes 1`\n"
+            f"`/dmgcalc`"
         ),
         inline=False,
     )
@@ -134,10 +140,18 @@ async def help_command(ctx):
     embed.add_field(
         name="🎯 Parameters",
         value=(
-            "**pokemon** - Pokemon name (required)\n"
-            "**generation** - gen1 to gen9 (default: gen9)\n"
-            "**tier** - ou, uu, ru, nu, pu, ubers, etc. (optional)\n"
-            "• If tier not specified, bot will search all tiers"
+            "**smogon command:**\n"
+            "• **pokemon** - Pokemon name (required)\n"
+            "• **generation** - gen1 to gen9 (default: gen9)\n"
+            "• **tier** - ou, uu, ru, nu, pu, ubers, etc. (optional)\n\n"
+            "**effortvalue command:**\n"
+            "• **pokemon** - Pokemon name (required)\n\n"
+            "**sprite command:**\n"
+            "• **pokemon** - Pokemon name (required)\n"
+            "• **shiny** - yes/no (default: no)\n"
+            "• **generation** - 1 to 9 (default: 9)\n\n"
+            "**dmgcalc command:**\n"
+            "• No parameters - opens Showdown calculator"
         ),
         inline=False,
     )
@@ -161,7 +175,12 @@ async def help_command(ctx):
             "• Interactive format selector\n"
             "• Multiple sets per Pokemon\n"
             "• Automatic tier detection\n"
-            "• Generation switcher"
+            "• Generation switcher\n"
+            "• EV yield lookup for training\n"
+            "• Pokemon sprite viewer (all gens)\n"
+            "• Shiny sprite support\n"
+            "• Damage calculator link\n"
+            "• Direct links to Smogon analysis"
         ),
         inline=False,
     )
@@ -182,15 +201,15 @@ async def ping(ctx):
     latency = round(bot.latency * 1000)
 
     # Simple message
-    message = f"Pong! (**{latency}ms** to gateway)"
+    message = f"🏓 Pong! **{latency}ms**"
 
-    # Send as ephemeral for slash commands, normal for prefix
-    if isinstance(ctx, commands.Context):
-        # Prefix command - can't be ephemeral
-        await ctx.send(message)
+    # Check if this is a slash command (has interaction)
+    if ctx.interaction:
+        # Slash command - ephemeral (only you can see this)
+        await ctx.send(message, ephemeral=True)
     else:
-        # Slash command - ephemeral (only you can see)
-        await ctx.response.send_message(message, ephemeral=True)
+        # Prefix command - public message
+        await ctx.send(message)
 
 
 # Load cogs

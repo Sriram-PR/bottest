@@ -10,6 +10,7 @@ from config.settings import (
     CACHE_TIMEOUT,
     FORMATS_BY_GEN,
     MAX_CACHE_SIZE,
+    POKEAPI_URL,
     PRIORITY_FORMATS,
     SMOGON_SETS_URL,
 )
@@ -275,3 +276,228 @@ class SmogonAPIClient:
         """Clear all cached data"""
         self.cache.clear()
         logger.info("Cache cleared")
+
+    async def get_pokemon_ev_yield(self, pokemon: str) -> Optional[Dict]:
+        """
+        Fetch EV yield data from PokeAPI
+
+        Args:
+            pokemon: Pokemon name (e.g., 'garchomp', 'landorus-therian')
+
+        Returns:
+            Dictionary with EV yields or None if not found
+            Example: {'hp': 0, 'attack': 3, 'defense': 0, 'special-attack': 0, 'special-defense': 0, 'speed': 0}
+        """
+        # Normalize pokemon name
+        pokemon = pokemon.lower().strip().replace(" ", "-")
+
+        # Check cache
+        cache_key = f"ev_yield:{pokemon}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            session = await self.get_session()
+            url = f"{POKEAPI_URL}/pokemon/{pokemon}"
+
+            logger.info(f"Fetching EV yield from PokeAPI: {url}")
+
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+
+                    # Extract EV yields from stats
+                    ev_yields = {}
+                    total_evs = 0
+
+                    for stat in data.get("stats", []):
+                        stat_name = stat["stat"]["name"]
+                        effort = stat["effort"]
+                        ev_yields[stat_name] = effort
+                        total_evs += effort
+
+                    # Add total and Pokemon info
+                    result = {
+                        "ev_yields": ev_yields,
+                        "total": total_evs,
+                        "name": data.get("name"),
+                        "id": data.get("id"),
+                        "sprite": data.get("sprites", {}).get("front_default"),
+                        "types": [t["type"]["name"] for t in data.get("types", [])],
+                    }
+
+                    # Cache for longer (EV yields never change)
+                    self._set_cache(cache_key, result)
+                    logger.info(f"Found EV yield for {pokemon}: {ev_yields}")
+
+                    return result
+
+                elif resp.status == 404:
+                    logger.warning(f"Pokemon {pokemon} not found in PokeAPI")
+                    return None
+                else:
+                    logger.error(f"PokeAPI error {resp.status} for {pokemon}")
+                    return None
+
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error fetching EV yield: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching EV yield for {pokemon}: {e}", exc_info=True)
+            return None
+
+    async def get_pokemon_sprite(
+        self, pokemon: str, shiny: bool = False, generation: int = 9
+    ) -> Optional[Dict]:
+        """
+        Fetch Pokemon sprite from PokeAPI
+
+        Args:
+            pokemon: Pokemon name (e.g., 'garchomp', 'landorus-therian')
+            shiny: Whether to get shiny sprite (default: False)
+            generation: Generation number 1-9 (default: 9)
+
+        Returns:
+            Dictionary with sprite data or None if not found
+        """
+        # Normalize pokemon name
+        pokemon = pokemon.lower().strip().replace(" ", "-")
+
+        # Check cache
+        cache_key = f"sprite:{pokemon}:{shiny}:{generation}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            session = await self.get_session()
+
+            # First, get Pokemon species data to check which generation it was introduced
+            species_url = f"{POKEAPI_URL}/pokemon-species/{pokemon}"
+
+            async with session.get(species_url) as species_resp:
+                if species_resp.status == 200:
+                    species_data = await species_resp.json()
+
+                    # Get generation introduced
+                    gen_data = species_data.get("generation", {})
+                    gen_url = gen_data.get("url", "")
+
+                    # Extract generation number from URL (e.g., ".../generation/4/" -> 4)
+                    try:
+                        introduced_gen = int(gen_url.rstrip("/").split("/")[-1])
+                    except (ValueError, IndexError):
+                        introduced_gen = 1  # Fallback to Gen 1 if can't parse
+
+                    # Check if Pokemon existed in requested generation
+                    if generation < introduced_gen:
+                        logger.warning(
+                            f"{pokemon} was introduced in Gen {introduced_gen}, "
+                            f"cannot show Gen {generation} sprite"
+                        )
+                        return {
+                            "error": "pokemon_not_in_generation",
+                            "introduced_gen": introduced_gen,
+                            "requested_gen": generation,
+                        }
+                elif species_resp.status == 404:
+                    logger.warning(f"Pokemon species {pokemon} not found in PokeAPI")
+                    return None
+
+            # Now fetch the sprite
+            url = f"{POKEAPI_URL}/pokemon/{pokemon}"
+
+            logger.info(f"Fetching sprite from PokeAPI: {url}")
+
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    sprites = data.get("sprites", {})
+
+                    # Get sprite based on generation and shiny
+                    sprite_url = None
+
+                    # Try generation-specific sprites first
+                    gen_map = {
+                        1: "generation-i",
+                        2: "generation-ii",
+                        3: "generation-iii",
+                        4: "generation-iv",
+                        5: "generation-v",
+                        6: "generation-vi",
+                        7: "generation-vii",
+                        8: "generation-viii",
+                        9: None,  # Gen 9 uses default sprites
+                    }
+
+                    if generation == 9:
+                        # Use default sprites for Gen 9
+                        if shiny:
+                            sprite_url = sprites.get("front_shiny")
+                        else:
+                            sprite_url = sprites.get("front_default")
+                    else:
+                        gen_key = gen_map.get(generation)
+                        if gen_key:
+                            versions = sprites.get("versions", {})
+                            gen_sprites = versions.get(gen_key, {})
+
+                            # Different generations have different game keys
+                            game_keys = list(gen_sprites.keys())
+                            if game_keys:
+                                # Try first game variant
+                                game_sprite = gen_sprites[game_keys[0]]
+                                if shiny:
+                                    sprite_url = game_sprite.get("front_shiny")
+                                else:
+                                    sprite_url = game_sprite.get("front_default")
+
+                                # If not found, try other game variants
+                                if not sprite_url and len(game_keys) > 1:
+                                    for game_key in game_keys[1:]:
+                                        game_sprite = gen_sprites[game_key]
+                                        if shiny:
+                                            sprite_url = game_sprite.get("front_shiny")
+                                        else:
+                                            sprite_url = game_sprite.get(
+                                                "front_default"
+                                            )
+                                        if sprite_url:
+                                            break
+
+                    # Don't fallback to default - if gen-specific sprite not found, return None
+                    if not sprite_url:
+                        logger.warning(
+                            f"No generation-specific sprite found for {pokemon} "
+                            f"(shiny={shiny}, gen={generation})"
+                        )
+                        return None
+
+                    result = {
+                        "sprite_url": sprite_url,
+                        "name": data.get("name"),
+                        "id": data.get("id"),
+                        "shiny": shiny,
+                        "generation": generation,
+                    }
+
+                    # Cache sprite data
+                    self._set_cache(cache_key, result)
+                    logger.info(f"Found sprite for {pokemon}")
+
+                    return result
+
+                elif resp.status == 404:
+                    logger.warning(f"Pokemon {pokemon} not found in PokeAPI")
+                    return None
+                else:
+                    logger.error(f"PokeAPI error {resp.status} for {pokemon}")
+                    return None
+
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error fetching sprite: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching sprite for {pokemon}: {e}", exc_info=True)
+            return None

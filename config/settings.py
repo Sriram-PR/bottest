@@ -16,9 +16,10 @@ if not DISCORD_TOKEN:
 
 # API Configuration
 SMOGON_SETS_URL = "https://data.pkmn.cc/sets"
+POKEAPI_URL = "https://pokeapi.co/api/v2"
 
 # Bot Settings
-BOT_COLOR = 0xE62129  # Smogon red
+BOT_COLOR = 0xFF7BA9  # Smogon red
 CACHE_TIMEOUT = 60  # 60 seconds
 MAX_EMBED_FIELDS = 25  # Discord limit
 MAX_CACHE_SIZE = 200  # Maximum cache entries (LRU)
