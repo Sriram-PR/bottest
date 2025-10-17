@@ -19,7 +19,7 @@ if not DISCORD_TOKEN:
 
 # Bot Configuration - Optional
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", ".")
-ENVIRONMENT = os.getenv("ENVIRONMENT", "production")  # production or development
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
 
 # Owner ID (for admin commands)
 OWNER_ID = os.getenv("OWNER_ID")
@@ -30,9 +30,7 @@ if OWNER_ID:
         raise ValueError("❌ OWNER_ID must be a valid integer!")
 else:
     OWNER_ID = 0
-    logger.warning(
-        "⚠️  OWNER_ID not set - admin commands (/uptime, /shiny-channel) will be unavailable"
-    )
+    logger.warning("⚠️  OWNER_ID not set - admin commands will be unavailable")
 
 # Target User ID (for shiny monitoring)
 TARGET_USER_ID = os.getenv("TARGET_USER_ID")
@@ -47,44 +45,41 @@ else:
 
 # Shiny Notification Configuration
 SHINY_NOTIFICATION_ENABLED = TARGET_USER_ID != 0
-
-# Customizable shiny notification message
 SHINY_NOTIFICATION_MESSAGE = os.getenv(
     "SHINY_NOTIFICATION_MESSAGE",
     "🌟 **SHINY POKEMON DETECTED!** 🌟\nA wild shiny has appeared!",
 )
-
-# Optional role to ping when shiny is found (role ID as string)
 SHINY_NOTIFICATION_PING_ROLE = os.getenv("SHINY_NOTIFICATION_PING_ROLE", "")
 
 # Data Storage
 DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)  # Create data directory if it doesn't exist
-SHINY_CHANNELS_FILE = DATA_DIR / "shiny_channels.json"
+DATA_DIR.mkdir(exist_ok=True)
+SHINY_CONFIG_FILE = DATA_DIR / "shiny_config.json"
 
 # API Configuration
 SMOGON_SETS_URL = "https://data.pkmn.cc/sets"
 POKEAPI_URL = "https://pokeapi.co/api/v2"
 
 # Bot Settings
-BOT_COLOR = 0xFF7BA9  # Smogon red
-MAX_EMBED_FIELDS = 25  # Discord limit
-MAX_GENERATION = 9  # Current maximum generation
+BOT_COLOR = 0xFF7BA9
+MAX_EMBED_FIELDS = 25
+MAX_GENERATION = 9
 
 # Cache Configuration
-CACHE_TIMEOUT = 60  # 60 seconds
-MAX_CACHE_SIZE = 200  # Maximum cache entries (LRU)
-CACHE_CLEANUP_INTERVAL = 300  # Clean expired cache every 5 minutes
-CACHE_PERSIST_TO_DISK = True  # Enable disk persistence for cache
+CACHE_TIMEOUT = 60
+MAX_CACHE_SIZE = 200
+CACHE_CLEANUP_INTERVAL = 300
+CACHE_PERSIST_TO_DISK = True
+FORMAT_CACHE_TIMEOUT = 86400  # Cache discovered formats for 24 hours
 
 # Rate Limiting
-MAX_CONCURRENT_API_REQUESTS = 5  # Maximum parallel API calls
-API_REQUEST_TIMEOUT = 30  # Seconds before timeout
+MAX_CONCURRENT_API_REQUESTS = 5
+API_REQUEST_TIMEOUT = 30
 
 # Retry Configuration
-MAX_RETRY_ATTEMPTS = 3  # Number of retries for failed API calls
-RETRY_BASE_DELAY = 1  # Base delay for exponential backoff (seconds)
-RETRY_MAX_DELAY = 10  # Maximum retry delay (seconds)
+MAX_RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 1
+RETRY_MAX_DELAY = 10
 
 # Command Cooldowns (seconds)
 SMOGON_COMMAND_COOLDOWN = 5
@@ -95,12 +90,12 @@ DEFAULT_COMMAND_COOLDOWN = 5
 # Circuit Breaker Settings
 CIRCUIT_BREAKER_ENABLED = True
 CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
-CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 60  # seconds
+CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 60
 
 # Logging Configuration
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # DEBUG, INFO, WARNING, ERROR
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Generation and Tier Mappings
+# Generation Mappings
 GENERATION_MAP = {
     "gen1": "gen1",
     "gen2": "gen2",
@@ -122,6 +117,7 @@ GENERATION_MAP = {
     "9": "gen9",
 }
 
+# Tier Mappings
 TIER_MAP = {
     "ou": "ou",
     "uu": "uu",
@@ -148,80 +144,92 @@ TIER_MAP = {
     "nfe": "nfe",
 }
 
-# Comprehensive format lists by generation
-# Formats to try when searching (ordered by popularity)
-FORMATS_BY_GEN = {
-    "gen9": [
-        "ou",
-        "ubers",
-        "uu",
-        "doublesou",
-        "ru",
-        "nu",
-        "pu",
-        "lc",
-        "monotype",
-        "1v1",
-        "vgc2025regh",
-        "zu",
-        "cap",
-        "ag",
-    ],
-    "gen8": [
-        "ou",
-        "ubers",
-        "uu",
-        "doublesou",
-        "ru",
-        "nu",
-        "pu",
-        "lc",
-        "monotype",
-        "1v1",
-        "nationaldex",
-        "vgc2021",
-        "zu",
-        "cap",
-        "ag",
-    ],
-    "gen7": [
-        "ou",
-        "ubers",
-        "uu",
-        "doublesou",
-        "ru",
-        "nu",
-        "pu",
-        "lc",
-        "monotype",
-        "1v1",
-        "vgc2019",
-        "zu",
-        "ag",
-    ],
-    "gen6": [
-        "ou",
-        "ubers",
-        "uu",
-        "doublesou",
-        "ru",
-        "nu",
-        "pu",
-        "lc",
-        "monotype",
-        "1v1",
-        "vgc2016",
-        "ag",
-    ],
-    "gen5": ["ou", "ubers", "uu", "doublesou", "ru", "nu", "lc", "monotype"],
-    "gen4": ["ou", "ubers", "uu", "ru", "nu", "lc"],
-    "gen3": ["ou", "ubers", "uu", "nu", "lc"],
-    "gen2": ["ou", "ubers", "uu", "nu"],
-    "gen1": ["ou", "ubers", "uu"],
-}
+# ============================================================================
+# COMPREHENSIVE FORMAT LIST
+# ============================================================================
+# Instead of maintaining per-generation lists, we have ONE comprehensive list
+# of ALL possible formats. The API will tell us which ones actually exist.
+# This automatically handles new formats without code changes!
+# ============================================================================
+
+COMPREHENSIVE_FORMAT_LIST = [
+    # Standard Tiers (priority order - most common first)
+    "ou",  # OverUsed - Most popular
+    "ubers",  # Ubers - Legendaries
+    "nationaldex",  # National Dex - All Pokemon
+    "uu",  # UnderUsed
+    "doublesou",  # Doubles OU
+    "ru",  # RarelyUsed
+    "nu",  # NeverUsed
+    "pu",  # PU
+    "zu",  # ZeroUsed
+    # Special Formats
+    "lc",  # Little Cup
+    "monotype",  # Monotype
+    "1v1",  # 1v1
+    "ag",  # Anything Goes
+    "cap",  # Create-A-Pokemon
+    # VGC Formats (by year)
+    "vgc2025regh",
+    "vgc2025regg",
+    "vgc2025regf",
+    "vgc2024regi",
+    "vgc2024regh",
+    "vgc2024regg",
+    "vgc2024regf",
+    "vgc2023",
+    "vgc2022",
+    "vgc2021",
+    "vgc2020",
+    "vgc2019",
+    "vgc2018",
+    "vgc2017",
+    "vgc2016",
+    "vgc2015",
+    "vgc2014",
+    "vgc2013",
+    "vgc2012",
+    "vgc2011",
+    # Battle Stadium Singles (BSS)
+    "battlestadiumsingles",
+    "bss",
+    # Other Competitive Formats
+    "uubers",  # UU Ubers (Gen 8)
+    "nfe",  # Not Fully Evolved
+    "lcuu",  # Little Cup UU
+    "doublesuu",  # Doubles UU
+    "doublesru",  # Doubles RU
+    "doublesnu",  # Doubles NU
+    "doubleslc",  # Doubles LC
+    "triples",  # Triples (Gen 6-7)
+    "rotation",  # Rotation (Gen 5)
+    # Metagames
+    "balancedhackmons",  # Balanced Hackmons
+    "mixandmega",  # Mix and Mega
+    "almostanyability",  # Almost Any Ability
+    "stabmons",  # STABmons
+    "ndag",  # National Dex AG
+    "godlygift",  # Godly Gift
+    "purehackmons",  # Pure Hackmons
+    # Past Gen Specific
+    "battlespot",  # Battle Spot (Gen 6-7)
+    "battlespotsingles",  # Battle Spot Singles
+    "battlespotdoubles",  # Battle Spot Doubles
+    "battlespottriples",  # Battle Spot Triples
+    # Misc
+    "uber",  # Alternate spelling
+    "pu2",  # PU alternative
+    "customgame",  # Custom Game
+]
 
 # Priority formats to check first (most common)
-PRIORITY_FORMATS = ["ou", "ubers", "uu", "doublesou"]
+PRIORITY_FORMATS = [
+    "ou",
+    "ubers",
+    "nationaldex",
+    "uu",
+    "doublesou",
+]
 
 # Format display names
 FORMAT_NAMES = {
@@ -241,10 +249,16 @@ FORMAT_NAMES = {
     "cap": "CAP",
     "nationaldex": "National Dex",
     "vgc2025regh": "VGC 2025 Reg H",
+    "vgc2025regg": "VGC 2025 Reg G",
+    "vgc2024regi": "VGC 2024 Reg I",
     "vgc2021": "VGC 2021",
     "vgc2019": "VGC 2019",
     "vgc2016": "VGC 2016",
     "nfe": "NFE",
+    "battlestadiumsingles": "Battle Stadium Singles",
+    "balancedhackmons": "Balanced Hackmons",
+    "mixandmega": "Mix and Mega",
+    "almostanyability": "Almost Any Ability",
 }
 
 # Smogon Dex generation codes
@@ -260,7 +274,7 @@ SMOGON_DEX_GENS = {
     "gen9": "sv",
 }
 
-# Emoji mappings for types
+# Type emojis
 TYPE_EMOJIS = {
     "normal": "⭐",
     "fire": "🔥",

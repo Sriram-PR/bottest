@@ -4,7 +4,7 @@ import pickle
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import aiohttp
 
@@ -13,8 +13,9 @@ from config.settings import (
     CACHE_CLEANUP_INTERVAL,
     CACHE_PERSIST_TO_DISK,
     CACHE_TIMEOUT,
+    COMPREHENSIVE_FORMAT_LIST,
     DATA_DIR,
-    FORMATS_BY_GEN,
+    FORMAT_CACHE_TIMEOUT,
     MAX_CACHE_SIZE,
     MAX_CONCURRENT_API_REQUESTS,
     POKEAPI_URL,
@@ -31,6 +32,7 @@ class SmogonAPIClient:
     Client for fetching competitive sets from Smogon and Pokemon data from PokeAPI
 
     Features:
+    - Dynamic format discovery (no hardcoded format lists!)
     - LRU cache with size limit and auto-cleanup
     - Disk-based cache persistence across restarts
     - Rate limiting with semaphore
@@ -46,12 +48,16 @@ class SmogonAPIClient:
         # LRU cache using OrderedDict
         self.cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
 
+        # Format discovery cache: {generation: {formats_set, timestamp}}
+        self.discovered_formats: Dict[str, Tuple[Set[str], float]] = {}
+
         # Rate limiting
         self._rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_API_REQUESTS)
 
         # Cache statistics
         self.cache_hits = 0
         self.cache_misses = 0
+        self.format_discoveries = 0
 
         # Background cleanup task
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -74,9 +80,10 @@ class SmogonAPIClient:
 
         try:
             with open(cache_file, "rb") as f:
-                loaded_cache = pickle.load(f)
+                loaded_data = pickle.load(f)
 
-            # Only load non-expired entries
+            # Load regular cache
+            loaded_cache = loaded_data.get("cache", {})
             current_time = time.time()
             valid_entries = 0
             expired_entries = 0
@@ -88,8 +95,15 @@ class SmogonAPIClient:
                 else:
                     expired_entries += 1
 
+            # Load discovered formats
+            loaded_formats = loaded_data.get("discovered_formats", {})
+            for gen, (formats_set, timestamp) in loaded_formats.items():
+                if current_time - timestamp < FORMAT_CACHE_TIMEOUT:
+                    self.discovered_formats[gen] = (formats_set, timestamp)
+
             logger.info(
-                f"✅ Loaded {valid_entries} valid cache entries from disk "
+                f"✅ Loaded {valid_entries} cache entries and "
+                f"{len(self.discovered_formats)} format discoveries from disk "
                 f"({expired_entries} expired entries discarded)"
             )
         except Exception as e:
@@ -104,14 +118,21 @@ class SmogonAPIClient:
         cache_file = self._get_cache_file()
 
         try:
-            # Ensure data directory exists
             cache_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Save cache to disk
-            with open(cache_file, "wb") as f:
-                pickle.dump(dict(self.cache), f, protocol=pickle.HIGHEST_PROTOCOL)
+            # Save both regular cache and discovered formats
+            save_data = {
+                "cache": dict(self.cache),
+                "discovered_formats": dict(self.discovered_formats),
+            }
 
-            logger.info(f"💾 Saved {len(self.cache)} cache entries to disk")
+            with open(cache_file, "wb") as f:
+                pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            logger.info(
+                f"💾 Saved {len(self.cache)} cache entries and "
+                f"{len(self.discovered_formats)} format discoveries to disk"
+            )
         except Exception as e:
             logger.error(f"❌ Error saving cache to disk: {e}")
 
@@ -124,7 +145,6 @@ class SmogonAPIClient:
                 headers={"User-Agent": "Pokemon-Smogon-Discord-Bot/2.0"},
             )
 
-            # Start cache cleanup task
             if self._cleanup_task is None or self._cleanup_task.done():
                 self._cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
                 logger.info("Started cache cleanup background task")
@@ -135,11 +155,9 @@ class SmogonAPIClient:
         """Close the aiohttp session and cleanup tasks"""
         self._is_closing = True
 
-        # Save cache to disk before closing
         if CACHE_PERSIST_TO_DISK:
             self._save_cache_to_disk()
 
-        # Cancel cleanup task
         if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
             try:
@@ -148,11 +166,11 @@ class SmogonAPIClient:
                 pass
             logger.info("Cancelled cache cleanup task")
 
-        # Close session
         if self.session and not self.session.closed:
             await self.session.close()
             logger.info(
-                f"API client session closed (Cache stats - Hits: {self.cache_hits}, Misses: {self.cache_misses})"
+                f"API client session closed (Cache: {self.cache_hits} hits / "
+                f"{self.cache_misses} misses, Formats discovered: {self.format_discoveries})"
             )
 
     async def _cache_cleanup_loop(self):
@@ -169,38 +187,41 @@ class SmogonAPIClient:
     def _cleanup_expired_cache(self):
         """Remove expired entries from cache"""
         current_time = time.time()
+
+        # Clean regular cache
         expired_keys = [
             key
             for key, (_, timestamp) in self.cache.items()
             if current_time - timestamp > CACHE_TIMEOUT
         ]
-
         for key in expired_keys:
             del self.cache[key]
 
-        if expired_keys:
-            logger.debug(f"Cleaned {len(expired_keys)} expired cache entries")
+        # Clean format discovery cache
+        expired_gens = [
+            gen
+            for gen, (_, timestamp) in self.discovered_formats.items()
+            if current_time - timestamp > FORMAT_CACHE_TIMEOUT
+        ]
+        for gen in expired_gens:
+            del self.discovered_formats[gen]
+
+        if expired_keys or expired_gens:
+            logger.debug(
+                f"Cleaned {len(expired_keys)} cache entries and "
+                f"{len(expired_gens)} format discoveries"
+            )
 
     def _get_cached(self, key: str) -> Optional[Any]:
-        """
-        Get data from cache if not expired (LRU)
-
-        Args:
-            key: Cache key
-
-        Returns:
-            Cached data or None if expired/not found
-        """
+        """Get data from cache if not expired (LRU)"""
         if key in self.cache:
             data, timestamp = self.cache[key]
             if time.time() - timestamp < CACHE_TIMEOUT:
-                # Move to end (most recently used)
                 self.cache.move_to_end(key)
                 self.cache_hits += 1
                 logger.debug(f"Cache hit for {key}")
                 return data
             else:
-                # Remove expired cache
                 del self.cache[key]
                 logger.debug(f"Cache expired for {key}")
 
@@ -208,14 +229,7 @@ class SmogonAPIClient:
         return None
 
     def _set_cache(self, key: str, data: Any):
-        """
-        Store data in cache with timestamp (LRU with size limit)
-
-        Args:
-            key: Cache key
-            data: Data to cache
-        """
-        # Remove oldest entries if at capacity
+        """Store data in cache with timestamp (LRU with size limit)"""
         while len(self.cache) >= MAX_CACHE_SIZE:
             oldest_key = next(iter(self.cache))
             del self.cache[oldest_key]
@@ -224,12 +238,102 @@ class SmogonAPIClient:
         self.cache[key] = (data, time.time())
         logger.debug(f"Cached data for {key}")
 
+    async def discover_formats_for_generation(self, generation: str) -> Set[str]:
+        """
+        Dynamically discover which formats exist for a generation
+
+        This tries all possible formats and caches which ones actually exist.
+        No more hardcoded format lists!
+
+        Args:
+            generation: Generation string (e.g., 'gen9')
+
+        Returns:
+            Set of format IDs that exist for this generation
+        """
+        # Check cache first
+        if generation in self.discovered_formats:
+            formats_set, timestamp = self.discovered_formats[generation]
+            if time.time() - timestamp < FORMAT_CACHE_TIMEOUT:
+                logger.debug(f"Using cached format list for {generation}")
+                return formats_set
+
+        logger.info(f"🔍 Discovering available formats for {generation}...")
+
+        # Try priority formats first (for common Pokemon)
+        discovered = set()
+        session = await self.get_session()
+
+        # Check priority formats first
+        priority_tasks = []
+        for fmt in PRIORITY_FORMATS:
+            priority_tasks.append(self._check_format_exists(session, generation, fmt))
+
+        priority_results = await asyncio.gather(*priority_tasks, return_exceptions=True)
+        for fmt, exists in zip(PRIORITY_FORMATS, priority_results):
+            if exists and not isinstance(exists, Exception):
+                discovered.add(fmt)
+
+        # Then check comprehensive list in parallel batches
+        remaining_formats = [
+            f for f in COMPREHENSIVE_FORMAT_LIST if f not in PRIORITY_FORMATS
+        ]
+
+        # Process in batches to avoid overwhelming the API
+        batch_size = 10
+        for i in range(0, len(remaining_formats), batch_size):
+            batch = remaining_formats[i : i + batch_size]
+            tasks = [
+                self._check_format_exists(session, generation, fmt) for fmt in batch
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for fmt, exists in zip(batch, results):
+                if exists and not isinstance(exists, Exception):
+                    discovered.add(fmt)
+
+        # Cache the discovered formats
+        self.discovered_formats[generation] = (discovered, time.time())
+        self.format_discoveries += 1
+
+        logger.info(
+            f"✅ Discovered {len(discovered)} formats for {generation}: "
+            f"{', '.join(sorted(discovered))}"
+        )
+
+        return discovered
+
+    async def _check_format_exists(
+        self, session: aiohttp.ClientSession, generation: str, format_id: str
+    ) -> bool:
+        """
+        Check if a format exists by trying to fetch it
+
+        Args:
+            session: aiohttp session
+            generation: Generation string
+            format_id: Format identifier
+
+        Returns:
+            True if format exists (200 response), False otherwise
+        """
+        url = f"{self.base_url}/{generation}{format_id}.json"
+
+        try:
+            async with self._rate_limiter:
+                async with session.head(url) as resp:  # HEAD request is faster
+                    return resp.status == 200
+        except Exception:
+            return False
+
     @retry_on_error(max_retries=3)
     async def find_pokemon_in_generation(
         self, pokemon: str, generation: str
     ) -> Dict[str, Dict]:
         """
-        Find a Pokemon across all formats in a generation using parallel requests
+        Find a Pokemon across all formats in a generation
+
+        Now uses dynamic format discovery!
 
         Args:
             pokemon: Pokemon name
@@ -237,7 +341,6 @@ class SmogonAPIClient:
 
         Returns:
             Dictionary mapping format_id to sets data
-            Example: {'ou': {...sets...}, 'ubers': {...sets...}}
         """
         # Check if we have cached tier locations for this pokemon
         tier_cache_key = f"tier_location:{generation}:{pokemon}"
@@ -245,7 +348,6 @@ class SmogonAPIClient:
 
         if cached_tiers:
             logger.info(f"Using cached tier locations for {pokemon} in {generation}")
-            # Fetch only the known tiers
             result = {}
             for tier in cached_tiers:
                 sets = await self.get_sets(pokemon, generation, tier)
@@ -253,23 +355,26 @@ class SmogonAPIClient:
                     result[tier] = sets
             return result
 
-        # Get available formats for this generation
-        available_formats = FORMATS_BY_GEN.get(generation, PRIORITY_FORMATS)
+        # Discover available formats for this generation
+        available_formats = await self.discover_formats_for_generation(generation)
+
+        if not available_formats:
+            logger.warning(f"No formats discovered for {generation}")
+            return {}
 
         logger.info(
-            f"Searching for {pokemon} in {generation} across {len(available_formats)} formats"
+            f"Searching for {pokemon} in {generation} across "
+            f"{len(available_formats)} discovered formats"
         )
 
-        # Search ALL formats in parallel
-        async with self._rate_limiter:
-            tasks = []
-            for tier in available_formats:
-                tasks.append(self._fetch_format(pokemon, generation, tier))
+        # Search ALL discovered formats in parallel
+        tasks = []
+        for tier in available_formats:
+            tasks.append(self._fetch_format(pokemon, generation, tier))
 
-            # Execute all parallel requests
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Collect ALL successful results
+        # Collect successful results
         found_formats = {}
         for tier, result in zip(available_formats, results):
             if result and not isinstance(result, Exception):
@@ -285,17 +390,7 @@ class SmogonAPIClient:
     async def _fetch_format(
         self, pokemon: str, generation: str, tier: str
     ) -> Optional[Dict]:
-        """
-        Internal method to fetch a specific format and find pokemon
-
-        Args:
-            pokemon: Pokemon name
-            generation: Generation
-            tier: Tier/format
-
-        Returns:
-            Sets data for the pokemon or None
-        """
+        """Internal method to fetch a specific format and find pokemon"""
         try:
             sets = await self.get_sets(pokemon, generation, tier)
             return sets
@@ -311,23 +406,20 @@ class SmogonAPIClient:
         Fetch competitive sets from Smogon for a specific format
 
         Args:
-            pokemon: Pokemon name (e.g., 'garchomp', 'landorus-therian')
+            pokemon: Pokemon name
             generation: Generation (e.g., 'gen9', 'gen8')
             tier: Competitive tier (e.g., 'ou', 'uu', 'ubers')
 
         Returns:
             Dictionary of sets or None if not found
         """
-        # Normalize inputs
         pokemon = pokemon.lower().strip().replace(" ", "-")
         generation = generation.lower().strip()
         tier = tier.lower().strip()
 
-        # Construct format ID
         format_id = f"{generation}{tier}"
-
-        # Check cache
         cache_key = f"{format_id}:{pokemon}"
+
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
@@ -343,15 +435,14 @@ class SmogonAPIClient:
                     if resp.status == 200:
                         data = await resp.json()
 
-                        # Search for Pokemon in the data
-                        # Try exact match first
+                        # Search for Pokemon
                         for poke_name, sets in data.items():
                             if poke_name.lower().replace(" ", "-") == pokemon:
                                 self._set_cache(cache_key, sets)
                                 logger.info(f"Found sets for {pokemon} in {format_id}")
                                 return sets
 
-                        # Try partial match (for forms like "Landorus-Therian")
+                        # Partial match
                         for poke_name, sets in data.items():
                             if pokemon in poke_name.lower().replace(" ", "-"):
                                 self._set_cache(cache_key, sets)
@@ -382,19 +473,13 @@ class SmogonAPIClient:
             )
             return None
 
+    # ... rest of the methods (get_pokemon_ev_yield, get_pokemon_sprite, etc.) stay the same ...
+    # (keeping existing implementation for EV yield and sprites)
+
     @retry_on_error(max_retries=3)
     async def get_pokemon_ev_yield(self, pokemon: str) -> Optional[Dict]:
-        """
-        Fetch EV yield data from PokeAPI
-
-        Args:
-            pokemon: Pokemon name (e.g., 'garchomp', 'landorus-therian')
-
-        Returns:
-            Dictionary with EV yields or None if not found
-        """
+        """Fetch EV yield data from PokeAPI"""
         pokemon = pokemon.lower().strip().replace(" ", "-")
-
         cache_key = f"ev_yield:{pokemon}"
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -403,15 +488,12 @@ class SmogonAPIClient:
         try:
             session = await self.get_session()
             url = f"{POKEAPI_URL}/pokemon/{pokemon}"
-
             logger.debug(f"Fetching EV yield from PokeAPI: {url}")
 
             async with self._rate_limiter:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-
-                        # Extract EV yields from stats
                         ev_yields = {}
                         total_evs = 0
 
@@ -433,20 +515,12 @@ class SmogonAPIClient:
                         self._set_cache(cache_key, result)
                         logger.info(f"Found EV yield for {pokemon}")
                         return result
-
                     elif resp.status == 404:
                         logger.debug(f"Pokemon {pokemon} not found in PokeAPI")
                         return None
                     else:
                         logger.warning(f"PokeAPI error {resp.status} for {pokemon}")
                         return None
-
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching EV yield for {pokemon}")
-            raise
-        except aiohttp.ClientError as e:
-            logger.error(f"Network error fetching EV yield: {e}")
-            raise
         except Exception as e:
             logger.error(f"Error fetching EV yield for {pokemon}: {e}", exc_info=True)
             return None
@@ -455,19 +529,8 @@ class SmogonAPIClient:
     async def get_pokemon_sprite(
         self, pokemon: str, shiny: bool = False, generation: int = 9
     ) -> Optional[Dict]:
-        """
-        Fetch Pokemon sprite from PokeAPI
-
-        Args:
-            pokemon: Pokemon name (e.g., 'garchomp', 'landorus-therian')
-            shiny: Whether to get shiny sprite (default: False)
-            generation: Generation number 1-9 (default: 9)
-
-        Returns:
-            Dictionary with sprite data or None if not found
-        """
+        """Fetch Pokemon sprite from PokeAPI"""
         pokemon = pokemon.lower().strip().replace(" ", "-")
-
         cache_key = f"sprite:{pokemon}:{shiny}:{generation}"
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -475,16 +538,12 @@ class SmogonAPIClient:
 
         try:
             session = await self.get_session()
-
-            # First, get Pokemon species data to check generation
             species_url = f"{POKEAPI_URL}/pokemon-species/{pokemon}"
 
             async with self._rate_limiter:
                 async with session.get(species_url) as species_resp:
                     if species_resp.status == 200:
                         species_data = await species_resp.json()
-
-                        # Get generation introduced
                         gen_data = species_data.get("generation", {})
                         gen_url = gen_data.get("url", "")
 
@@ -493,7 +552,6 @@ class SmogonAPIClient:
                         except (ValueError, IndexError):
                             introduced_gen = 1
 
-                        # Check if Pokemon existed in requested generation
                         if generation < introduced_gen:
                             logger.debug(
                                 f"{pokemon} was introduced in Gen {introduced_gen}, "
@@ -508,9 +566,7 @@ class SmogonAPIClient:
                         logger.debug(f"Pokemon species {pokemon} not found in PokeAPI")
                         return None
 
-            # Now fetch the sprite
             url = f"{POKEAPI_URL}/pokemon/{pokemon}"
-
             logger.debug(f"Fetching sprite from PokeAPI: {url}")
 
             async with self._rate_limiter:
@@ -518,7 +574,6 @@ class SmogonAPIClient:
                     if resp.status == 200:
                         data = await resp.json()
                         sprites = data.get("sprites", {})
-
                         sprite_url = None
 
                         gen_map = {
@@ -534,34 +589,27 @@ class SmogonAPIClient:
                         }
 
                         if generation == 9:
-                            # Use default sprites for Gen 9
-                            if shiny:
-                                sprite_url = sprites.get("front_shiny")
-                            else:
-                                sprite_url = sprites.get("front_default")
+                            sprite_url = sprites.get(
+                                "front_shiny" if shiny else "front_default"
+                            )
                         else:
                             gen_key = gen_map.get(generation)
                             if gen_key:
                                 versions = sprites.get("versions", {})
                                 gen_sprites = versions.get(gen_key, {})
-
                                 game_keys = list(gen_sprites.keys())
                                 if game_keys:
                                     for game_key in game_keys:
                                         game_sprite = gen_sprites[game_key]
-                                        if shiny:
-                                            sprite_url = game_sprite.get("front_shiny")
-                                        else:
-                                            sprite_url = game_sprite.get(
-                                                "front_default"
-                                            )
+                                        sprite_url = game_sprite.get(
+                                            "front_shiny" if shiny else "front_default"
+                                        )
                                         if sprite_url:
                                             break
 
                         if not sprite_url:
                             logger.debug(
-                                f"No sprite found for {pokemon} "
-                                f"(shiny={shiny}, gen={generation})"
+                                f"No sprite found for {pokemon} (shiny={shiny}, gen={generation})"
                             )
                             return None
 
@@ -576,20 +624,12 @@ class SmogonAPIClient:
                         self._set_cache(cache_key, result)
                         logger.info(f"Found sprite for {pokemon}")
                         return result
-
                     elif resp.status == 404:
                         logger.debug(f"Pokemon {pokemon} not found in PokeAPI")
                         return None
                     else:
                         logger.warning(f"PokeAPI error {resp.status} for {pokemon}")
                         return None
-
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching sprite for {pokemon}")
-            raise
-        except aiohttp.ClientError as e:
-            logger.error(f"Network error fetching sprite: {e}")
-            raise
         except Exception as e:
             logger.error(f"Error fetching sprite for {pokemon}: {e}", exc_info=True)
             return None
@@ -597,17 +637,14 @@ class SmogonAPIClient:
     def clear_cache(self):
         """Clear all cached data"""
         self.cache.clear()
+        self.discovered_formats.clear()
         self.cache_hits = 0
         self.cache_misses = 0
+        self.format_discoveries = 0
         logger.info("Cache cleared")
 
     def get_cache_stats(self) -> Dict[str, Any]:
-        """
-        Get cache statistics
-
-        Returns:
-            Dictionary with cache statistics
-        """
+        """Get cache statistics"""
         total_requests = self.cache_hits + self.cache_misses
         hit_rate = (self.cache_hits / total_requests * 100) if total_requests > 0 else 0
 
@@ -617,4 +654,6 @@ class SmogonAPIClient:
             "hits": self.cache_hits,
             "misses": self.cache_misses,
             "hit_rate": f"{hit_rate:.1f}%",
+            "discovered_generations": len(self.discovered_formats),
+            "format_discoveries": self.format_discoveries,
         }

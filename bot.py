@@ -4,7 +4,7 @@ import logging
 import re
 import sys
 import time
-from typing import Optional, Set
+from typing import Dict, Optional, Set
 
 import discord
 from discord.ext import commands
@@ -14,7 +14,7 @@ from config.settings import (
     DISCORD_TOKEN,
     LOG_LEVEL,
     OWNER_ID,
-    SHINY_CHANNELS_FILE,
+    SHINY_CONFIG_FILE,
     SHINY_NOTIFICATION_MESSAGE,
     SHINY_NOTIFICATION_PING_ROLE,
     TARGET_USER_ID,
@@ -40,30 +40,65 @@ intents.guilds = True
 SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*★")
 
 
+class GuildShinyConfig:
+    """Configuration for shiny monitoring in a specific guild"""
+
+    def __init__(self, guild_id: int):
+        self.guild_id = guild_id
+        self.channels: Set[int] = set()
+        self.embed_channel_id: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON storage"""
+        return {
+            "channels": list(self.channels),
+            "embed_channel_id": self.embed_channel_id,
+        }
+
+    @classmethod
+    def from_dict(cls, guild_id: int, data: dict) -> "GuildShinyConfig":
+        """Create from dictionary"""
+        config = cls(guild_id)
+        config.channels = set(data.get("channels", []))
+        config.embed_channel_id = data.get("embed_channel_id")
+        return config
+
+
 class SmogonBot(commands.Bot):
     """Custom bot class with proper lifecycle management"""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.start_time: Optional[float] = None
-        self.shiny_channels: Set[int] = set()  # Store configured channel IDs
+        # Per-guild configurations
+        self.shiny_configs: Dict[int, GuildShinyConfig] = {}
 
     async def setup_hook(self):
         """Called when bot is starting up - for async initialization"""
         logger.info("Bot setup hook called - performing async initialization")
         self.start_time = time.time()
 
-        # Load shiny channels from file
-        self.shiny_channels = load_shiny_channels()
-        logger.info(f"Loaded {len(self.shiny_channels)} shiny notification channel(s)")
+        # Load per-guild shiny configurations
+        self.shiny_configs = load_shiny_configs()
+
+        total_channels = sum(
+            len(config.channels) for config in self.shiny_configs.values()
+        )
+        total_archives = sum(
+            1 for config in self.shiny_configs.values() if config.embed_channel_id
+        )
+
+        logger.info(f"Loaded configurations for {len(self.shiny_configs)} guild(s)")
+        logger.info(f"Total monitored channels: {total_channels}")
+        logger.info(f"Guilds with archive channels: {total_archives}")
 
     async def close(self):
         """Override close to ensure proper cleanup of resources"""
         logger.info("Bot shutdown initiated - cleaning up resources")
 
-        # Save shiny channels before shutdown
-        save_shiny_channels(self.shiny_channels)
-        logger.info("Saved shiny notification channels")
+        # Save shiny configurations before shutdown
+        save_shiny_configs(self.shiny_configs)
+        logger.info("Saved shiny configurations")
 
         # Close API client sessions from all loaded cogs
         for cog_name, cog in self.cogs.items():
@@ -77,33 +112,66 @@ class SmogonBot(commands.Bot):
         logger.info("Cleanup complete - shutting down bot")
         await super().close()
 
+    def get_guild_config(self, guild_id: int) -> GuildShinyConfig:
+        """Get or create guild configuration"""
+        if guild_id not in self.shiny_configs:
+            self.shiny_configs[guild_id] = GuildShinyConfig(guild_id)
+            logger.info(f"Created new configuration for guild {guild_id}")
+        return self.shiny_configs[guild_id]
+
 
 # Create bot instance
 bot = SmogonBot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
 
 
-# Helper functions for shiny channels persistence
-def load_shiny_channels() -> Set[int]:
-    """Load shiny notification channels from JSON file"""
+# Helper functions for shiny configuration persistence
+def load_shiny_configs() -> Dict[int, GuildShinyConfig]:
+    """Load per-guild shiny configurations from JSON file"""
     try:
-        if SHINY_CHANNELS_FILE.exists():
-            with open(SHINY_CHANNELS_FILE, "r") as f:
+        if SHINY_CONFIG_FILE.exists():
+            with open(SHINY_CONFIG_FILE, "r") as f:
                 data = json.load(f)
-                return set(data.get("channels", []))
-        return set()
+
+                # Handle old format (migrate to new format)
+                if "channels" in data and "guilds" not in data:
+                    logger.warning(
+                        "Old configuration format detected - migrating to per-guild format"
+                    )
+                    # Old global format - will need manual guild assignment
+                    return {}
+
+                # New per-guild format
+                guilds_data = data.get("guilds", {})
+                configs = {}
+
+                for guild_id_str, guild_data in guilds_data.items():
+                    guild_id = int(guild_id_str)
+                    configs[guild_id] = GuildShinyConfig.from_dict(guild_id, guild_data)
+
+                return configs
+
+        return {}
     except Exception as e:
-        logger.error(f"Error loading shiny channels: {e}")
-        return set()
+        logger.error(f"Error loading shiny configurations: {e}")
+        return {}
 
 
-def save_shiny_channels(channels: Set[int]) -> bool:
-    """Save shiny notification channels to JSON file"""
+def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
+    """Save per-guild shiny configurations to JSON file"""
     try:
-        with open(SHINY_CHANNELS_FILE, "w") as f:
-            json.dump({"channels": list(channels)}, f, indent=2)
+        # Convert to saveable format
+        guilds_data = {}
+        for guild_id, config in configs.items():
+            guilds_data[str(guild_id)] = config.to_dict()
+
+        data = {"guilds": guilds_data}
+
+        with open(SHINY_CONFIG_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
         return True
     except Exception as e:
-        logger.error(f"Error saving shiny channels: {e}")
+        logger.error(f"Error saving shiny configurations: {e}")
         return False
 
 
@@ -115,9 +183,19 @@ async def on_ready():
     logger.info(f"Bot ID: {bot.user.id}")
     logger.info(f"Connected to {len(bot.guilds)} guild(s)")
     logger.info(f"Discord.py version: {discord.__version__}")
+
     if TARGET_USER_ID:
         logger.info(f"Monitoring user ID: {TARGET_USER_ID} for shiny Pokemon")
-    logger.info(f"Shiny notification channels: {len(bot.shiny_channels)}")
+
+    # Log per-guild statistics
+    for guild in bot.guilds:
+        if guild.id in bot.shiny_configs:
+            config = bot.shiny_configs[guild.id]
+            logger.info(
+                f"  └─ {guild.name}: {len(config.channels)} monitored channel(s), "
+                f"archive: {'✓' if config.embed_channel_id else '✗'}"
+            )
+
     logger.info(f"{'=' * 50}")
 
     # Sync slash commands
@@ -135,57 +213,103 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    """Monitor messages for shiny Pokemon from target user"""
+    """Monitor messages for shiny Pokemon from target user in configured channels"""
 
     # Ignore bot's own messages
     if message.author.id == bot.user.id:
+        return
+
+    # Ignore DMs (no guild)
+    if not message.guild:
+        await bot.process_commands(message)
         return
 
     # Wrap shiny detection in try-except to prevent bot crashes
     try:
         # Check if message is from target user
         if TARGET_USER_ID and message.author.id == TARGET_USER_ID:
-            # Check if message has embeds
-            if message.embeds:
-                first_embed = message.embeds[0]
+            # Get guild-specific configuration
+            guild_config = bot.shiny_configs.get(message.guild.id)
 
-                # Use regex pattern for more robust matching
-                if first_embed.title and SHINY_PATTERN.search(first_embed.title):
-                    logger.info(f"✨ Shiny detected! Embed title: {first_embed.title}")
+            if guild_config and message.channel.id in guild_config.channels:
+                # Check if message has embeds
+                if message.embeds:
+                    first_embed = message.embeds[0]
 
-                    # Build notification message from config
-                    notification_message = SHINY_NOTIFICATION_MESSAGE
+                    # Use regex pattern for more robust matching
+                    if first_embed.title and SHINY_PATTERN.search(first_embed.title):
+                        logger.info(
+                            f"✨ Shiny detected in {message.guild.name}#{message.channel.name}! "
+                            f"Embed title: {first_embed.title}"
+                        )
 
-                    # Add role ping if configured
-                    if SHINY_NOTIFICATION_PING_ROLE:
-                        notification_message = f"<@&{SHINY_NOTIFICATION_PING_ROLE}>\n{notification_message}"
+                        # Build notification message from config
+                        notification_message = SHINY_NOTIFICATION_MESSAGE
 
-                    # Post notification in all configured channels
-                    for channel_id in bot.shiny_channels:
+                        # Add role ping if configured
+                        if SHINY_NOTIFICATION_PING_ROLE:
+                            notification_message = f"<@&{SHINY_NOTIFICATION_PING_ROLE}>\n{notification_message}"
+
+                        # Send notification to THE SAME CHANNEL where shiny was found
                         try:
-                            channel = bot.get_channel(channel_id)
-                            if channel:
-                                await channel.send(notification_message)
-                                logger.info(
-                                    f"Posted shiny notification to channel: {channel.name} ({channel_id})"
-                                )
-                            else:
-                                logger.warning(
-                                    f"Channel {channel_id} not found (may have been deleted)"
-                                )
+                            await message.channel.send(notification_message)
+                            logger.info(
+                                f"Posted shiny notification to {message.channel.name}"
+                            )
                         except discord.Forbidden:
                             logger.error(
-                                f"No permission to send in channel {channel_id}"
+                                f"No permission to send in channel {message.channel.id}"
                             )
                         except discord.HTTPException as e:
-                            logger.error(
-                                f"HTTP error sending to channel {channel_id}: {e}"
-                            )
+                            logger.error(f"HTTP error sending notification: {e}")
                         except Exception as e:
                             logger.error(
-                                f"Unexpected error sending to channel {channel_id}: {e}",
+                                f"Unexpected error sending notification: {e}",
                                 exc_info=True,
                             )
+
+                        # Forward embed to archive channel if configured for this guild
+                        if guild_config.embed_channel_id:
+                            try:
+                                archive_channel = bot.get_channel(
+                                    guild_config.embed_channel_id
+                                )
+                                if archive_channel:
+                                    # Create jump link
+                                    jump_link = (
+                                        f"https://discord.com/channels/{message.guild.id}/"
+                                        f"{message.channel.id}/{message.id}"
+                                    )
+
+                                    # Send the original embed
+                                    await archive_channel.send(embed=first_embed)
+
+                                    # Send jump link
+                                    await archive_channel.send(
+                                        f"Jump to message: {jump_link}"
+                                    )
+
+                                    logger.info(
+                                        f"Forwarded shiny embed to archive channel {archive_channel.name} "
+                                        f"in {message.guild.name}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Archive channel {guild_config.embed_channel_id} not found "
+                                        f"in {message.guild.name} (may have been deleted)"
+                                    )
+                            except discord.Forbidden:
+                                logger.error(
+                                    f"No permission to send in archive channel "
+                                    f"{guild_config.embed_channel_id} in {message.guild.name}"
+                                )
+                            except discord.HTTPException as e:
+                                logger.error(f"HTTP error forwarding to archive: {e}")
+                            except Exception as e:
+                                logger.error(
+                                    f"Unexpected error forwarding to archive: {e}",
+                                    exc_info=True,
+                                )
 
     except Exception as e:
         # Log error but don't crash the bot
@@ -201,12 +325,19 @@ async def on_guild_join(guild: discord.Guild):
     logger.info(
         f"✅ Joined guild: {guild.name} (ID: {guild.id}, Members: {guild.member_count})"
     )
+    # Create empty config for new guild
+    bot.get_guild_config(guild.id)
 
 
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
     """Called when bot is removed from a guild"""
     logger.info(f"❌ Removed from guild: {guild.name} (ID: {guild.id})")
+    # Optionally remove guild config
+    if guild.id in bot.shiny_configs:
+        del bot.shiny_configs[guild.id]
+        save_shiny_configs(bot.shiny_configs)
+        logger.info(f"Removed configuration for guild {guild.id}")
 
 
 @bot.event
@@ -299,7 +430,7 @@ async def on_app_command_error(
 # Shiny Channel Management Commands (Developer Only)
 @bot.tree.command(
     name="shiny-channel",
-    description="Manage shiny notification channels (Developer only)",
+    description="Manage shiny monitoring channels for this server (Developer only)",
 )
 @discord.app_commands.describe(
     action="Action to perform",
@@ -318,7 +449,7 @@ async def shiny_channel(
     action: discord.app_commands.Choice[str],
     channel: Optional[discord.TextChannel] = None,
 ):
-    """Manage channels for shiny Pokemon notifications"""
+    """Manage channels to monitor for shiny Pokemon in this server"""
 
     # Check if user is owner
     if interaction.user.id != OWNER_ID:
@@ -327,63 +458,74 @@ async def shiny_channel(
         )
         return
 
+    # Must be used in a guild
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    # Get guild-specific configuration
+    guild_config = bot.get_guild_config(interaction.guild.id)
     action_value = action.value
 
     # Use provided channel or current channel
     target_channel = channel or interaction.channel
 
     if action_value == "add":
-        if target_channel.id in bot.shiny_channels:
+        if target_channel.id in guild_config.channels:
             await interaction.response.send_message(
-                f"⚠️ {target_channel.mention} is already in the shiny notification list.",
+                f"⚠️ {target_channel.mention} is already being monitored for shinies in this server.",
                 ephemeral=True,
             )
         else:
-            bot.shiny_channels.add(target_channel.id)
-            save_shiny_channels(bot.shiny_channels)
+            guild_config.channels.add(target_channel.id)
+            save_shiny_configs(bot.shiny_configs)
             await interaction.response.send_message(
-                f"✅ Added {target_channel.mention} to shiny notification channels.\n"
-                f"Total channels: {len(bot.shiny_channels)}",
+                f"✅ Added {target_channel.mention} to shiny monitoring in **{interaction.guild.name}**.\n"
+                f"Total channels in this server: {len(guild_config.channels)}",
                 ephemeral=True,
             )
             logger.info(
-                f"Added channel {target_channel.name} ({target_channel.id}) to shiny notifications"
+                f"Added channel {target_channel.name} ({target_channel.id}) to shiny monitoring "
+                f"in guild {interaction.guild.name} ({interaction.guild.id})"
             )
 
     elif action_value == "remove":
-        if target_channel.id not in bot.shiny_channels:
+        if target_channel.id not in guild_config.channels:
             await interaction.response.send_message(
-                f"⚠️ {target_channel.mention} is not in the shiny notification list.",
+                f"⚠️ {target_channel.mention} is not being monitored for shinies in this server.",
                 ephemeral=True,
             )
         else:
-            bot.shiny_channels.remove(target_channel.id)
-            save_shiny_channels(bot.shiny_channels)
+            guild_config.channels.remove(target_channel.id)
+            save_shiny_configs(bot.shiny_configs)
             await interaction.response.send_message(
-                f"✅ Removed {target_channel.mention} from shiny notification channels.\n"
-                f"Total channels: {len(bot.shiny_channels)}",
+                f"✅ Removed {target_channel.mention} from shiny monitoring in **{interaction.guild.name}**.\n"
+                f"Total channels in this server: {len(guild_config.channels)}",
                 ephemeral=True,
             )
             logger.info(
-                f"Removed channel {target_channel.name} ({target_channel.id}) from shiny notifications"
+                f"Removed channel {target_channel.name} ({target_channel.id}) from shiny monitoring "
+                f"in guild {interaction.guild.name} ({interaction.guild.id})"
             )
 
     elif action_value == "list":
-        if not bot.shiny_channels:
+        if not guild_config.channels:
             await interaction.response.send_message(
-                "📋 No channels configured for shiny notifications.\n"
+                f"📋 No channels configured for shiny monitoring in **{interaction.guild.name}**.\n"
                 "Use `/shiny-channel add` to add channels.",
                 ephemeral=True,
             )
         else:
             embed = discord.Embed(
-                title="🌟 Shiny Notification Channels",
-                description=f"Total: {len(bot.shiny_channels)} channel(s)",
+                title=f"🔍 Shiny Monitoring - {interaction.guild.name}",
+                description=f"Bot monitors these channels for shinies from target user\nTotal: {len(guild_config.channels)} channel(s)",
                 color=0xFFD700,
             )
 
             channel_list = []
-            for channel_id in bot.shiny_channels:
+            for channel_id in guild_config.channels:
                 channel_obj = bot.get_channel(channel_id)
                 if channel_obj:
                     channel_list.append(f"• {channel_obj.mention} (`{channel_id}`)")
@@ -393,7 +535,7 @@ async def shiny_channel(
                     )
 
             embed.add_field(
-                name="Configured Channels",
+                name="Monitored Channels",
                 value="\n".join(channel_list) if channel_list else "None",
                 inline=False,
             )
@@ -405,19 +547,154 @@ async def shiny_channel(
                     inline=False,
                 )
 
-            embed.set_footer(text="Bot will post shiny alerts in these channels")
+            if guild_config.embed_channel_id:
+                archive_channel = bot.get_channel(guild_config.embed_channel_id)
+                if archive_channel:
+                    embed.add_field(
+                        name="Archive Channel",
+                        value=f"{archive_channel.mention} (`{guild_config.embed_channel_id}`)",
+                        inline=False,
+                    )
+                else:
+                    embed.add_field(
+                        name="Archive Channel",
+                        value=f"Unknown (`{guild_config.embed_channel_id}`) - May have been deleted",
+                        inline=False,
+                    )
+
+            embed.set_footer(
+                text=f"Configuration is specific to {interaction.guild.name}"
+            )
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
     elif action_value == "clear":
-        count = len(bot.shiny_channels)
-        bot.shiny_channels.clear()
-        save_shiny_channels(bot.shiny_channels)
+        count = len(guild_config.channels)
+        guild_config.channels.clear()
+        save_shiny_configs(bot.shiny_configs)
         await interaction.response.send_message(
-            f"✅ Cleared all shiny notification channels ({count} removed).",
+            f"✅ Cleared all shiny monitoring channels in **{interaction.guild.name}** ({count} removed).",
             ephemeral=True,
         )
-        logger.info(f"Cleared all {count} shiny notification channels")
+        logger.info(
+            f"Cleared all {count} shiny monitoring channels in guild "
+            f"{interaction.guild.name} ({interaction.guild.id})"
+        )
+
+
+# Shiny Archive Channel Management (Developer Only)
+@bot.tree.command(
+    name="shiny-archive",
+    description="Manage shiny archive channel for this server (Developer only)",
+)
+@discord.app_commands.describe(
+    action="Action to perform",
+    channel="Channel to set as archive (leave empty for current channel)",
+)
+@discord.app_commands.choices(
+    action=[
+        discord.app_commands.Choice(name="set", value="set"),
+        discord.app_commands.Choice(name="unset", value="unset"),
+        discord.app_commands.Choice(name="show", value="show"),
+    ]
+)
+async def shiny_archive(
+    interaction: discord.Interaction,
+    action: discord.app_commands.Choice[str],
+    channel: Optional[discord.TextChannel] = None,
+):
+    """Manage archive channel where shiny embeds are forwarded in this server"""
+
+    # Check if user is owner
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ This command is only available to the bot owner.", ephemeral=True
+        )
+        return
+
+    # Must be used in a guild
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    # Get guild-specific configuration
+    guild_config = bot.get_guild_config(interaction.guild.id)
+    action_value = action.value
+
+    if action_value == "set":
+        # Use provided channel or current channel
+        target_channel = channel or interaction.channel
+
+        guild_config.embed_channel_id = target_channel.id
+        save_shiny_configs(bot.shiny_configs)
+
+        await interaction.response.send_message(
+            f"✅ Set {target_channel.mention} as the shiny archive channel for **{interaction.guild.name}**.\n"
+            f"Shiny embeds will be forwarded here with jump links.",
+            ephemeral=True,
+        )
+        logger.info(
+            f"Set shiny archive channel to {target_channel.name} ({target_channel.id}) "
+            f"in guild {interaction.guild.name} ({interaction.guild.id})"
+        )
+
+    elif action_value == "unset":
+        if guild_config.embed_channel_id is None:
+            await interaction.response.send_message(
+                f"⚠️ No archive channel is currently set for **{interaction.guild.name}**.",
+                ephemeral=True,
+            )
+        else:
+            old_channel_id = guild_config.embed_channel_id
+            guild_config.embed_channel_id = None
+            save_shiny_configs(bot.shiny_configs)
+
+            await interaction.response.send_message(
+                f"✅ Removed archive channel from **{interaction.guild.name}** (was: `{old_channel_id}`).\n"
+                f"Shiny embeds will no longer be forwarded.",
+                ephemeral=True,
+            )
+            logger.info(
+                f"Unset shiny archive channel (was: {old_channel_id}) "
+                f"in guild {interaction.guild.name} ({interaction.guild.id})"
+            )
+
+    elif action_value == "show":
+        if guild_config.embed_channel_id is None:
+            await interaction.response.send_message(
+                f"📋 No archive channel is currently configured for **{interaction.guild.name}**.\n"
+                "Use `/shiny-archive set` to set one.",
+                ephemeral=True,
+            )
+        else:
+            archive_channel = bot.get_channel(guild_config.embed_channel_id)
+
+            embed = discord.Embed(
+                title=f"📦 Shiny Archive - {interaction.guild.name}",
+                description="Shiny embeds are forwarded to this channel",
+                color=0xFFD700,
+            )
+
+            if archive_channel:
+                embed.add_field(
+                    name="Archive Channel",
+                    value=f"{archive_channel.mention} (`{guild_config.embed_channel_id}`)",
+                    inline=False,
+                )
+            else:
+                embed.add_field(
+                    name="Archive Channel",
+                    value=f"Unknown Channel (`{guild_config.embed_channel_id}`) - May have been deleted",
+                    inline=False,
+                )
+
+            embed.set_footer(
+                text=f"Configuration is specific to {interaction.guild.name}"
+            )
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # Help command
@@ -433,77 +710,16 @@ async def help_command(ctx: commands.Context):
     embed.add_field(
         name="📖 Command Usage",
         value=(
-            f"**Slash Command:**\n"
-            f"`/smogon <pokemon> [generation] [tier]`\n"
-            f"`/effortvalue <pokemon>`\n"
-            f"`/sprite <pokemon> [shiny] [generation]`\n"
-            f"`/dmgcalc`\n"
-            f"`/ping`\n"
-            f"`/uptime` (Developer only)\n"
-            f"`/shiny-channel <action>` (Developer only)\n\n"
-            f"**Prefix Command:**\n"
-            f"`{COMMAND_PREFIX}smogon <pokemon> [generation] [tier]`\n"
-            f"`{COMMAND_PREFIX}effortvalue <pokemon>`\n"
-            f"`{COMMAND_PREFIX}sprite <pokemon> [shiny] [generation]`\n"
-            f"`{COMMAND_PREFIX}dmgcalc`\n"
-            f"`{COMMAND_PREFIX}ping`\n\n"
-            f"**Examples:**\n"
-            f"`/smogon garchomp`\n"
-            f"`/effortvalue blissey`\n"
-            f"`/sprite charizard yes 1`\n"
-            f"`/dmgcalc`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🎯 Parameters",
-        value=(
-            "**smogon command:**\n"
-            "• **pokemon** - Pokemon name (required)\n"
-            "• **generation** - gen1 to gen9 (default: gen9)\n"
-            "• **tier** - ou, uu, ru, nu, pu, ubers, etc. (optional)\n\n"
-            "**effortvalue command:**\n"
-            "• **pokemon** - Pokemon name (required)\n\n"
-            "**sprite command:**\n"
-            "• **pokemon** - Pokemon name (required)\n"
-            "• **shiny** - yes/no (default: no)\n"
-            "• **generation** - 1 to 9 (default: 9)\n\n"
-            "**dmgcalc command:**\n"
-            "• No parameters - opens Showdown calculator\n\n"
-            "**shiny-channel command:**\n"
-            "• **action** - add/remove/list/clear\n"
-            "• **channel** - Target channel (optional)"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🌐 Supported Tiers",
-        value=(
-            "OU, UU, RU, NU, PU, ZU\n"
-            "Ubers, UUbers\n"
-            "LC (Little Cup)\n"
-            "VGC, Doubles OU\n"
-            "1v1, Monotype, AG (Anything Goes)\n"
-            "National Dex, CAP"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="✨ Features",
-        value=(
-            "• Interactive format selector\n"
-            "• Multiple sets per Pokemon\n"
-            "• Automatic tier detection\n"
-            "• Generation switcher\n"
-            "• EV yield lookup for training\n"
-            "• Pokemon sprite viewer (all gens)\n"
-            "• Shiny sprite support\n"
-            "• Damage calculator link\n"
-            "• Direct links to Smogon analysis\n"
-            "• Automatic shiny Pokemon alerts"
+            "**Slash Command:**\n"
+            "`/smogon <pokemon> [generation] [tier]`\n"
+            "`/effortvalue <pokemon>`\n"
+            "`/sprite <pokemon> [shiny] [generation]`\n"
+            "`/dmgcalc`\n"
+            "`/ping`\n"
+            "`/uptime` (Developer only)\n"
+            "`/shiny-channel <action>` (Developer only)\n"
+            "`/shiny-archive <action>` (Developer only)\n\n"
+            "**Note:** Shiny commands are per-server. Each server has its own configuration."
         ),
         inline=False,
     )
@@ -566,56 +782,38 @@ async def uptime(interaction: discord.Interaction):
         user_count = sum(g.member_count for g in bot.guilds if g.member_count)
         latency = round(bot.latency * 1000)
 
-        # Get cache stats if available
-        cache_info = ""
-        for cog in bot.cogs.values():
-            if hasattr(cog, "api_client"):
-                try:
-                    stats = cog.api_client.get_cache_stats()
-                    cache_info = (
-                        f"\n📊 **Cache Stats:**\n"
-                        f"Size: {stats['size']}/{stats['max_size']}\n"
-                        f"Hit Rate: {stats['hit_rate']}\n"
-                        f"Hits: {stats['hits']} | Misses: {stats['misses']}"
-                    )
-                    break
-                except:
-                    pass
+        # Get shiny monitoring stats
+        total_monitored = sum(
+            len(config.channels) for config in bot.shiny_configs.values()
+        )
+        guilds_with_archive = sum(
+            1 for config in bot.shiny_configs.values() if config.embed_channel_id
+        )
 
         embed = discord.Embed(
             title="🤖 Bot Status", color=0x00FF00, timestamp=interaction.created_at
         )
 
         embed.add_field(name="⏰ Uptime", value=uptime_str, inline=True)
-
         embed.add_field(name="🏓 Latency", value=f"{latency}ms", inline=True)
-
         embed.add_field(name="🌐 Servers", value=str(guild_count), inline=True)
-
         embed.add_field(name="👥 Users", value=f"{user_count:,}", inline=True)
-
         embed.add_field(name="📦 Discord.py", value=discord.__version__, inline=True)
-
         embed.add_field(
             name="🐍 Python",
             value=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             inline=True,
         )
 
-        if cache_info:
-            embed.add_field(
-                name="📊 Cache",
-                value=cache_info.split("**Cache Stats:**\n")[1]
-                if "**Cache Stats:**" in cache_info
-                else cache_info,
-                inline=False,
-            )
-
-        # Add shiny notification stats
+        # Add shiny monitoring stats
         if TARGET_USER_ID:
             embed.add_field(
-                name="🌟 Shiny Alerts",
-                value=f"Monitoring: <@{TARGET_USER_ID}>\nChannels: {len(bot.shiny_channels)}",
+                name="🌟 Shiny Monitoring",
+                value=(
+                    f"User: <@{TARGET_USER_ID}>\n"
+                    f"Total Channels: {total_monitored}\n"
+                    f"Servers w/ Archive: {guilds_with_archive}/{len(bot.shiny_configs)}"
+                ),
                 inline=False,
             )
 
