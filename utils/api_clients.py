@@ -321,7 +321,7 @@ class SmogonAPIClient:
 
         try:
             async with self._rate_limiter:
-                async with session.head(url) as resp:  # HEAD request is faster
+                async with session.get(url) as resp:  # HEAD request is faster
                     return resp.status == 200
         except Exception:
             return False
