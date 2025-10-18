@@ -4,7 +4,7 @@ import pickle
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 
@@ -13,9 +13,8 @@ from config.settings import (
     CACHE_CLEANUP_INTERVAL,
     CACHE_PERSIST_TO_DISK,
     CACHE_TIMEOUT,
-    COMPREHENSIVE_FORMAT_LIST,
     DATA_DIR,
-    FORMAT_CACHE_TIMEOUT,
+    FORMATS_BY_GEN,
     MAX_CACHE_SIZE,
     MAX_CONCURRENT_API_REQUESTS,
     POKEAPI_URL,
@@ -32,7 +31,6 @@ class SmogonAPIClient:
     Client for fetching competitive sets from Smogon and Pokemon data from PokeAPI
 
     Features:
-    - Dynamic format discovery (no hardcoded format lists!)
     - LRU cache with size limit and auto-cleanup
     - Disk-based cache persistence across restarts
     - Rate limiting with semaphore
@@ -48,16 +46,12 @@ class SmogonAPIClient:
         # LRU cache using OrderedDict
         self.cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
 
-        # Format discovery cache: {generation: {formats_set, timestamp}}
-        self.discovered_formats: Dict[str, Tuple[Set[str], float]] = {}
-
         # Rate limiting
         self._rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_API_REQUESTS)
 
         # Cache statistics
         self.cache_hits = 0
         self.cache_misses = 0
-        self.format_discoveries = 0
 
         # Background cleanup task
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -80,32 +74,30 @@ class SmogonAPIClient:
 
         try:
             with open(cache_file, "rb") as f:
-                loaded_data = pickle.load(f)
+                loaded_cache = pickle.load(f)
 
-            # Load regular cache
-            loaded_cache = loaded_data.get("cache", {})
-            current_time = time.time()
-            valid_entries = 0
-            expired_entries = 0
+            # Handle both old and new cache formats
+            if isinstance(loaded_cache, dict):
+                if "cache" in loaded_cache:
+                    # New format with nested structure
+                    loaded_cache = loaded_cache["cache"]
 
-            for key, (data, timestamp) in loaded_cache.items():
-                if current_time - timestamp < CACHE_TIMEOUT:
-                    self.cache[key] = (data, timestamp)
-                    valid_entries += 1
-                else:
-                    expired_entries += 1
+                # Load non-expired entries
+                current_time = time.time()
+                valid_entries = 0
+                expired_entries = 0
 
-            # Load discovered formats
-            loaded_formats = loaded_data.get("discovered_formats", {})
-            for gen, (formats_set, timestamp) in loaded_formats.items():
-                if current_time - timestamp < FORMAT_CACHE_TIMEOUT:
-                    self.discovered_formats[gen] = (formats_set, timestamp)
+                for key, (data, timestamp) in loaded_cache.items():
+                    if current_time - timestamp < CACHE_TIMEOUT:
+                        self.cache[key] = (data, timestamp)
+                        valid_entries += 1
+                    else:
+                        expired_entries += 1
 
-            logger.info(
-                f"✅ Loaded {valid_entries} cache entries and "
-                f"{len(self.discovered_formats)} format discoveries from disk "
-                f"({expired_entries} expired entries discarded)"
-            )
+                logger.info(
+                    f"✅ Loaded {valid_entries} valid cache entries from disk "
+                    f"({expired_entries} expired entries discarded)"
+                )
         except Exception as e:
             logger.error(f"❌ Error loading cache from disk: {e}")
             logger.info("Starting with empty cache")
@@ -120,19 +112,10 @@ class SmogonAPIClient:
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Save both regular cache and discovered formats
-            save_data = {
-                "cache": dict(self.cache),
-                "discovered_formats": dict(self.discovered_formats),
-            }
-
             with open(cache_file, "wb") as f:
-                pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(dict(self.cache), f, protocol=pickle.HIGHEST_PROTOCOL)
 
-            logger.info(
-                f"💾 Saved {len(self.cache)} cache entries and "
-                f"{len(self.discovered_formats)} format discoveries to disk"
-            )
+            logger.info(f"💾 Saved {len(self.cache)} cache entries to disk")
         except Exception as e:
             logger.error(f"❌ Error saving cache to disk: {e}")
 
@@ -169,8 +152,7 @@ class SmogonAPIClient:
         if self.session and not self.session.closed:
             await self.session.close()
             logger.info(
-                f"API client session closed (Cache: {self.cache_hits} hits / "
-                f"{self.cache_misses} misses, Formats discovered: {self.format_discoveries})"
+                f"API client session closed (Cache stats - Hits: {self.cache_hits}, Misses: {self.cache_misses})"
             )
 
     async def _cache_cleanup_loop(self):
@@ -187,30 +169,17 @@ class SmogonAPIClient:
     def _cleanup_expired_cache(self):
         """Remove expired entries from cache"""
         current_time = time.time()
-
-        # Clean regular cache
         expired_keys = [
             key
             for key, (_, timestamp) in self.cache.items()
             if current_time - timestamp > CACHE_TIMEOUT
         ]
+
         for key in expired_keys:
             del self.cache[key]
 
-        # Clean format discovery cache
-        expired_gens = [
-            gen
-            for gen, (_, timestamp) in self.discovered_formats.items()
-            if current_time - timestamp > FORMAT_CACHE_TIMEOUT
-        ]
-        for gen in expired_gens:
-            del self.discovered_formats[gen]
-
-        if expired_keys or expired_gens:
-            logger.debug(
-                f"Cleaned {len(expired_keys)} cache entries and "
-                f"{len(expired_gens)} format discoveries"
-            )
+        if expired_keys:
+            logger.debug(f"Cleaned {len(expired_keys)} expired cache entries")
 
     def _get_cached(self, key: str) -> Optional[Any]:
         """Get data from cache if not expired (LRU)"""
@@ -238,102 +207,12 @@ class SmogonAPIClient:
         self.cache[key] = (data, time.time())
         logger.debug(f"Cached data for {key}")
 
-    async def discover_formats_for_generation(self, generation: str) -> Set[str]:
-        """
-        Dynamically discover which formats exist for a generation
-
-        This tries all possible formats and caches which ones actually exist.
-        No more hardcoded format lists!
-
-        Args:
-            generation: Generation string (e.g., 'gen9')
-
-        Returns:
-            Set of format IDs that exist for this generation
-        """
-        # Check cache first
-        if generation in self.discovered_formats:
-            formats_set, timestamp = self.discovered_formats[generation]
-            if time.time() - timestamp < FORMAT_CACHE_TIMEOUT:
-                logger.debug(f"Using cached format list for {generation}")
-                return formats_set
-
-        logger.info(f"🔍 Discovering available formats for {generation}...")
-
-        # Try priority formats first (for common Pokemon)
-        discovered = set()
-        session = await self.get_session()
-
-        # Check priority formats first
-        priority_tasks = []
-        for fmt in PRIORITY_FORMATS:
-            priority_tasks.append(self._check_format_exists(session, generation, fmt))
-
-        priority_results = await asyncio.gather(*priority_tasks, return_exceptions=True)
-        for fmt, exists in zip(PRIORITY_FORMATS, priority_results):
-            if exists and not isinstance(exists, Exception):
-                discovered.add(fmt)
-
-        # Then check comprehensive list in parallel batches
-        remaining_formats = [
-            f for f in COMPREHENSIVE_FORMAT_LIST if f not in PRIORITY_FORMATS
-        ]
-
-        # Process in batches to avoid overwhelming the API
-        batch_size = 10
-        for i in range(0, len(remaining_formats), batch_size):
-            batch = remaining_formats[i : i + batch_size]
-            tasks = [
-                self._check_format_exists(session, generation, fmt) for fmt in batch
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for fmt, exists in zip(batch, results):
-                if exists and not isinstance(exists, Exception):
-                    discovered.add(fmt)
-
-        # Cache the discovered formats
-        self.discovered_formats[generation] = (discovered, time.time())
-        self.format_discoveries += 1
-
-        logger.info(
-            f"✅ Discovered {len(discovered)} formats for {generation}: "
-            f"{', '.join(sorted(discovered))}"
-        )
-
-        return discovered
-
-    async def _check_format_exists(
-        self, session: aiohttp.ClientSession, generation: str, format_id: str
-    ) -> bool:
-        """
-        Check if a format exists by trying to fetch it
-
-        Args:
-            session: aiohttp session
-            generation: Generation string
-            format_id: Format identifier
-
-        Returns:
-            True if format exists (200 response), False otherwise
-        """
-        url = f"{self.base_url}/{generation}{format_id}.json"
-
-        try:
-            async with self._rate_limiter:
-                async with session.get(url) as resp:  # HEAD request is faster
-                    return resp.status == 200
-        except Exception:
-            return False
-
     @retry_on_error(max_retries=3)
     async def find_pokemon_in_generation(
         self, pokemon: str, generation: str
     ) -> Dict[str, Dict]:
         """
-        Find a Pokemon across all formats in a generation
-
-        Now uses dynamic format discovery!
+        Find a Pokemon across all formats in a generation using parallel requests
 
         Args:
             pokemon: Pokemon name
@@ -355,26 +234,22 @@ class SmogonAPIClient:
                     result[tier] = sets
             return result
 
-        # Discover available formats for this generation
-        available_formats = await self.discover_formats_for_generation(generation)
-
-        if not available_formats:
-            logger.warning(f"No formats discovered for {generation}")
-            return {}
+        # Get available formats for this generation
+        available_formats = FORMATS_BY_GEN.get(generation, PRIORITY_FORMATS)
 
         logger.info(
-            f"Searching for {pokemon} in {generation} across "
-            f"{len(available_formats)} discovered formats"
+            f"Searching for {pokemon} in {generation} across {len(available_formats)} formats"
         )
 
-        # Search ALL discovered formats in parallel
-        tasks = []
-        for tier in available_formats:
-            tasks.append(self._fetch_format(pokemon, generation, tier))
+        # Search ALL formats in parallel
+        async with self._rate_limiter:
+            tasks = []
+            for tier in available_formats:
+                tasks.append(self._fetch_format(pokemon, generation, tier))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Collect successful results
+        # Collect ALL successful results
         found_formats = {}
         for tier, result in zip(available_formats, results):
             if result and not isinstance(result, Exception):
@@ -637,7 +512,6 @@ class SmogonAPIClient:
     def clear_cache(self):
         """Clear all cached data"""
         self.cache.clear()
-        self.discovered_formats.clear()
         self.cache_hits = 0
         self.cache_misses = 0
         self.format_discoveries = 0
@@ -654,6 +528,5 @@ class SmogonAPIClient:
             "hits": self.cache_hits,
             "misses": self.cache_misses,
             "hit_rate": f"{hit_rate:.1f}%",
-            "discovered_generations": len(self.discovered_formats),
             "format_discoveries": self.format_discoveries,
         }
