@@ -38,7 +38,8 @@ intents.guilds = True
 
 # Shiny detection pattern - more robust than hardcoded Unicode
 # SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*★")
-SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*\u2605", re.UNICODE)
+# SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*\u2605", re.UNICODE)
+SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*Nymble", re.UNICODE)
 
 
 class GuildShinyConfig:
