@@ -348,9 +348,6 @@ class SmogonAPIClient:
             )
             return None
 
-    # ... rest of the methods (get_pokemon_ev_yield, get_pokemon_sprite, etc.) stay the same ...
-    # (keeping existing implementation for EV yield and sprites)
-
     @retry_on_error(max_retries=3)
     async def get_pokemon_ev_yield(self, pokemon: str) -> Optional[Dict]:
         """Fetch EV yield data from PokeAPI"""
@@ -514,7 +511,6 @@ class SmogonAPIClient:
         self.cache.clear()
         self.cache_hits = 0
         self.cache_misses = 0
-        self.format_discoveries = 0
         logger.info("Cache cleared")
 
     def get_cache_stats(self) -> Dict[str, Any]:
@@ -528,5 +524,4 @@ class SmogonAPIClient:
             "hits": self.cache_hits,
             "misses": self.cache_misses,
             "hit_rate": f"{hit_rate:.1f}%",
-            "format_discoveries": self.format_discoveries,
         }

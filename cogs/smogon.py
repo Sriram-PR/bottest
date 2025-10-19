@@ -12,6 +12,7 @@ from config.settings import (
     SPRITE_COMMAND_COOLDOWN,
 )
 from utils.api_clients import SmogonAPIClient
+from utils.decorators import hybrid_defer
 from utils.helpers import (
     capitalize_pokemon_name,
     create_error_embed,
@@ -78,16 +79,9 @@ class Smogon(commands.Cog):
             .smogon charizard gen7 uu
             /smogon garchomp gen9 ou
         """
-        # Defer response for slash commands
-        if ctx.interaction:
-            await ctx.defer()
-        else:
-            async with ctx.typing():
-                await self._process_smogon_command(ctx, pokemon, generation, tier)
-                return
-
         await self._process_smogon_command(ctx, pokemon, generation, tier)
 
+    @hybrid_defer
     async def _process_smogon_command(
         self,
         ctx: commands.Context,
@@ -235,16 +229,9 @@ class Smogon(commands.Cog):
             .ev blissey
             /effortvalue chansey
         """
-        # Defer response for slash commands
-        if ctx.interaction:
-            await ctx.defer()
-        else:
-            async with ctx.typing():
-                await self._process_ev_command(ctx, pokemon)
-                return
-
         await self._process_ev_command(ctx, pokemon)
 
+    @hybrid_defer
     async def _process_ev_command(self, ctx: commands.Context, pokemon: str):
         """Process the EV yield command logic with validation"""
 
@@ -359,16 +346,9 @@ class Smogon(commands.Cog):
             .sprite pikachu no 1
             /sprite mewtwo yes 1
         """
-        # Defer response for slash commands
-        if ctx.interaction:
-            await ctx.defer()
-        else:
-            async with ctx.typing():
-                await self._process_sprite_command(ctx, pokemon, shiny, generation)
-                return
-
         await self._process_sprite_command(ctx, pokemon, shiny, generation)
 
+    @hybrid_defer
     async def _process_sprite_command(
         self, ctx: commands.Context, pokemon: str, shiny: str, generation: int
     ):

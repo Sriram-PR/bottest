@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 from typing import Dict, Optional, Set
@@ -37,7 +38,6 @@ intents.message_content = True
 intents.guilds = True
 
 # Shiny detection pattern - more robust than hardcoded Unicode
-# SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*★")
 SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*\u2605", re.UNICODE)
 
 
@@ -152,14 +152,36 @@ def load_shiny_configs() -> Dict[int, GuildShinyConfig]:
                 return configs
 
         return {}
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Corrupted JSON in shiny config file: {e}")
+        logger.warning(
+            "Starting with empty config - previous config may be in .bak file"
+        )
+        return {}
     except Exception as e:
         logger.error(f"Error loading shiny configurations: {e}")
         return {}
 
 
 def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
-    """Save per-guild shiny configurations to JSON file"""
+    """
+    Save per-guild shiny configurations to JSON file with atomic writes and backup
+
+    Uses atomic file operations to prevent data loss on crash/power failure
+    """
     try:
+        # Ensure data directory exists with proper error handling
+        try:
+            SHINY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            logger.error(
+                f"❌ No permission to create directory: {SHINY_CONFIG_FILE.parent}"
+            )
+            return False
+        except OSError as e:
+            logger.error(f"❌ OS error creating directory: {e}")
+            return False
+
         # Convert to saveable format
         guilds_data = {}
         for guild_id, config in configs.items():
@@ -167,12 +189,48 @@ def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
 
         data = {"guilds": guilds_data}
 
-        with open(SHINY_CONFIG_FILE, "w") as f:
-            json.dump(data, f, indent=2)
+        # Create backup of existing file before overwriting
+        if SHINY_CONFIG_FILE.exists():
+            backup_file = SHINY_CONFIG_FILE.with_suffix(".json.bak")
+            try:
+                shutil.copy2(SHINY_CONFIG_FILE, backup_file)
+                logger.debug(f"Created backup: {backup_file}")
+            except Exception as e:
+                logger.warning(f"Could not create backup: {e}")
+                # Continue anyway - backup is optional
 
-        return True
+        # Atomic write: write to temp file first, then rename
+        temp_file = SHINY_CONFIG_FILE.with_suffix(".json.tmp")
+
+        try:
+            # Write to temp file
+            with open(temp_file, "w") as f:
+                json.dump(data, f, indent=2)
+
+            # Validate JSON is readable before replacing original
+            with open(temp_file, "r") as f:
+                json.load(f)  # This will raise JSONDecodeError if corrupted
+
+            # Atomic rename (replaces original file)
+            temp_file.replace(SHINY_CONFIG_FILE)
+
+            logger.debug("Saved shiny configs atomically")
+            return True
+
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Generated invalid JSON: {e}")
+            # Don't replace the original file with broken JSON
+            if temp_file.exists():
+                temp_file.unlink()
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error during atomic write: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
+            return False
+
     except Exception as e:
-        logger.error(f"Error saving shiny configurations: {e}")
+        logger.error(f"Error saving shiny configurations: {e}", exc_info=True)
         return False
 
 
@@ -227,83 +285,93 @@ async def on_message(message: discord.Message):
 
     # Wrap shiny detection in try-except to prevent bot crashes
     try:
-        # 🐛 DEBUG: Log all messages from target user
+        # Check if this is a message from the target user
         if TARGET_USER_ID and message.author.id == TARGET_USER_ID:
-            logger.info("=" * 60)
-            logger.info("🎯 MESSAGE FROM TARGET USER DETECTED!")
-            logger.info(
-                f"   Author ID: {message.author.id} (Name: {message.author.name})"
-            )
-            logger.info(f"   Guild: {message.guild.name} (ID: {message.guild.id})")
-            logger.info(
-                f"   Channel: #{message.channel.name} (ID: {message.channel.id})"
-            )
-            logger.info(f"   Message ID: {message.id}")
-            logger.info(
-                f"   Content: {message.content[:100] if message.content else 'No text content'}"
-            )
-
-            # Get guild-specific configuration
-            guild_config = bot.shiny_configs.get(message.guild.id)
-
-            logger.info(f"   Guild has config: {guild_config is not None}")
-            if guild_config:
-                logger.info(f"   Monitored channels: {guild_config.channels}")
-                logger.info(
-                    f"   Current channel monitored: {message.channel.id in guild_config.channels}"
+            # Only show verbose debug logging if LOG_LEVEL is DEBUG
+            if LOG_LEVEL.upper() == "DEBUG":
+                logger.debug("=" * 60)
+                logger.debug("🎯 MESSAGE FROM TARGET USER DETECTED!")
+                logger.debug(
+                    f"   Author ID: {message.author.id} (Name: {message.author.name})"
+                )
+                logger.debug(f"   Guild: {message.guild.name} (ID: {message.guild.id})")
+                logger.debug(
+                    f"   Channel: #{message.channel.name} (ID: {message.channel.id})"
+                )
+                logger.debug(f"   Message ID: {message.id}")
+                logger.debug(
+                    f"   Content: {message.content[:100] if message.content else 'No text content'}"
                 )
 
-            # Check embeds
-            logger.info(f"   Number of embeds: {len(message.embeds)}")
+                # Get guild-specific configuration
+                guild_config = bot.shiny_configs.get(message.guild.id)
 
-            if message.embeds:
-                for idx, embed in enumerate(message.embeds):
-                    logger.info(f"   --- Embed {idx + 1} ---")
+                logger.debug(f"   Guild has config: {guild_config is not None}")
+                if guild_config:
+                    logger.debug(f"   Monitored channels: {guild_config.channels}")
+                    logger.debug(
+                        f"   Current channel monitored: {message.channel.id in guild_config.channels}"
+                    )
 
-                    # Focus on AUTHOR field (where the pattern actually is)
-                    if embed.author:
-                        logger.info("   ✅ Embed has author field!")
-                        logger.info(f"   Author Name: '{embed.author.name}'")
-                        logger.info(f"   Author Name type: {type(embed.author.name)}")
-                        logger.info(
-                            f"   Author Name length: {len(embed.author.name) if embed.author.name else 0}"
-                        )
-                        logger.info(f"   Author Name repr: {repr(embed.author.name)}")
+                # Check embeds
+                logger.debug(f"   Number of embeds: {len(message.embeds)}")
 
-                        # Test pattern matching on author.name
-                        if embed.author.name:
-                            pattern_match = SHINY_PATTERN.search(embed.author.name)
-                            logger.info(
-                                f"   🔍 Pattern match on author.name: {pattern_match}"
+                if message.embeds:
+                    for idx, embed in enumerate(message.embeds):
+                        logger.debug(f"   --- Embed {idx + 1} ---")
+
+                        # Focus on AUTHOR field (where the pattern actually is)
+                        if embed.author:
+                            logger.debug("   ✅ Embed has author field!")
+                            logger.debug(f"   Author Name: '{embed.author.name}'")
+                            logger.debug(
+                                f"   Author Name type: {type(embed.author.name)}"
                             )
-                            if pattern_match:
-                                logger.info(
-                                    f"   ✅ PATTERN MATCHED IN AUTHOR.NAME! Match: {pattern_match.group()}"
-                                )
-                            else:
-                                logger.info("   ❌ Pattern did NOT match author.name")
-                                # Show character codes
-                                logger.info(
-                                    f"   Author name character codes: {[hex(ord(c)) for c in embed.author.name[:50]]}"
-                                )
-                    else:
-                        logger.info("   ⚠️ Embed has NO author field!")
+                            logger.debug(
+                                f"   Author Name length: {len(embed.author.name) if embed.author.name else 0}"
+                            )
+                            logger.debug(
+                                f"   Author Name repr: {repr(embed.author.name)}"
+                            )
 
-                    # Log other fields for reference
-                    logger.info(f"   Title: '{embed.title}'")
-                    logger.info(
-                        f"   Description: {embed.description[:100] if embed.description else 'None'}"
-                    )
-                    logger.info(f"   Color: {embed.color}")
-                    logger.info(
-                        f"   Image URL: {embed.image.url if embed.image else 'None'}"
-                    )
-            else:
-                logger.info("   ⚠️ No embeds in message!")
+                            # Test pattern matching on author.name
+                            if embed.author.name:
+                                pattern_match = SHINY_PATTERN.search(embed.author.name)
+                                logger.debug(
+                                    f"   🔍 Pattern match on author.name: {pattern_match}"
+                                )
+                                if pattern_match:
+                                    logger.debug(
+                                        f"   ✅ PATTERN MATCHED IN AUTHOR.NAME! Match: {pattern_match.group()}"
+                                    )
+                                else:
+                                    logger.debug(
+                                        "   ❌ Pattern did NOT match author.name"
+                                    )
+                                    # Show character codes
+                                    logger.debug(
+                                        f"   Author name character codes: {[hex(ord(c)) for c in embed.author.name[:50]]}"
+                                    )
+                        else:
+                            logger.debug("   ⚠️ Embed has NO author field!")
 
-            logger.info("=" * 60)
+                        # Log other fields for reference
+                        logger.debug(f"   Title: '{embed.title}'")
+                        logger.debug(
+                            f"   Description: {embed.description[:100] if embed.description else 'None'}"
+                        )
+                        logger.debug(f"   Color: {embed.color}")
+                        logger.debug(
+                            f"   Image URL: {embed.image.url if embed.image else 'None'}"
+                        )
+                else:
+                    logger.debug("   ⚠️ No embeds in message!")
+
+                logger.debug("=" * 60)
 
             # ACTUAL DETECTION LOGIC - Check author.name only!
+            guild_config = bot.shiny_configs.get(message.guild.id)
+
             if guild_config and message.channel.id in guild_config.channels:
                 # Check if message has embeds
                 if message.embeds:

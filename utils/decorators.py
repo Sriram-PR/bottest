@@ -8,6 +8,7 @@ from functools import wraps
 from typing import Callable, Optional, Type, Union
 
 import aiohttp
+from discord.ext import commands
 
 from utils.constants import (
     DEFAULT_RETRY_ATTEMPTS,
@@ -100,6 +101,37 @@ def log_command_usage(func: Callable):
             )
 
         return await func(*args, **kwargs)
+
+    return wrapper
+
+
+def hybrid_defer(func: Callable):
+    """
+    Decorator to handle defer/typing logic for hybrid commands
+
+    This eliminates code duplication by centralizing the defer pattern.
+    For slash commands: shows "thinking..." status
+    For prefix commands: shows typing indicator
+
+    Usage:
+        @hybrid_defer
+        async def _process_smogon_command(self, ctx, pokemon, generation, tier):
+            # Your command logic here
+            ...
+    """
+
+    @wraps(func)
+    async def wrapper(self, ctx: commands.Context, *args, **kwargs):
+        # Check if this is a slash command or prefix command
+        if ctx.interaction:
+            # Slash command - defer the response
+            await ctx.defer()
+            # Execute the actual command logic
+            return await func(self, ctx, *args, **kwargs)
+        else:
+            # Prefix command - show typing indicator
+            async with ctx.typing():
+                return await func(self, ctx, *args, **kwargs)
 
     return wrapper
 
