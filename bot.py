@@ -228,21 +228,97 @@ async def on_message(message: discord.Message):
 
     # Wrap shiny detection in try-except to prevent bot crashes
     try:
-        # Check if message is from target user
+        # 🐛 DEBUG: Log all messages from target user
         if TARGET_USER_ID and message.author.id == TARGET_USER_ID:
+            logger.info("=" * 60)
+            logger.info("🎯 MESSAGE FROM TARGET USER DETECTED!")
+            logger.info(
+                f"   Author ID: {message.author.id} (Name: {message.author.name})"
+            )
+            logger.info(f"   Guild: {message.guild.name} (ID: {message.guild.id})")
+            logger.info(
+                f"   Channel: #{message.channel.name} (ID: {message.channel.id})"
+            )
+            logger.info(f"   Message ID: {message.id}")
+            logger.info(
+                f"   Content: {message.content[:100] if message.content else 'No text content'}"
+            )
+
             # Get guild-specific configuration
             guild_config = bot.shiny_configs.get(message.guild.id)
 
+            logger.info(f"   Guild has config: {guild_config is not None}")
+            if guild_config:
+                logger.info(f"   Monitored channels: {guild_config.channels}")
+                logger.info(
+                    f"   Current channel monitored: {message.channel.id in guild_config.channels}"
+                )
+
+            # Check embeds
+            logger.info(f"   Number of embeds: {len(message.embeds)}")
+
+            if message.embeds:
+                for idx, embed in enumerate(message.embeds):
+                    logger.info(f"   --- Embed {idx + 1} ---")
+
+                    # Focus on AUTHOR field (where the pattern actually is)
+                    if embed.author:
+                        logger.info("   ✅ Embed has author field!")
+                        logger.info(f"   Author Name: '{embed.author.name}'")
+                        logger.info(f"   Author Name type: {type(embed.author.name)}")
+                        logger.info(
+                            f"   Author Name length: {len(embed.author.name) if embed.author.name else 0}"
+                        )
+                        logger.info(f"   Author Name repr: {repr(embed.author.name)}")
+
+                        # Test pattern matching on author.name
+                        if embed.author.name:
+                            pattern_match = SHINY_PATTERN.search(embed.author.name)
+                            logger.info(
+                                f"   🔍 Pattern match on author.name: {pattern_match}"
+                            )
+                            if pattern_match:
+                                logger.info(
+                                    f"   ✅ PATTERN MATCHED IN AUTHOR.NAME! Match: {pattern_match.group()}"
+                                )
+                            else:
+                                logger.info("   ❌ Pattern did NOT match author.name")
+                                # Show character codes
+                                logger.info(
+                                    f"   Author name character codes: {[hex(ord(c)) for c in embed.author.name[:50]]}"
+                                )
+                    else:
+                        logger.info("   ⚠️ Embed has NO author field!")
+
+                    # Log other fields for reference
+                    logger.info(f"   Title: '{embed.title}'")
+                    logger.info(
+                        f"   Description: {embed.description[:100] if embed.description else 'None'}"
+                    )
+                    logger.info(f"   Color: {embed.color}")
+                    logger.info(
+                        f"   Image URL: {embed.image.url if embed.image else 'None'}"
+                    )
+            else:
+                logger.info("   ⚠️ No embeds in message!")
+
+            logger.info("=" * 60)
+
+            # ACTUAL DETECTION LOGIC - Check author.name only!
             if guild_config and message.channel.id in guild_config.channels:
                 # Check if message has embeds
                 if message.embeds:
                     first_embed = message.embeds[0]
 
-                    # Use regex pattern for more robust matching
-                    if first_embed.title and SHINY_PATTERN.search(first_embed.title):
+                    # Check for pattern in embed.author.name (NOT title!)
+                    if (
+                        first_embed.author
+                        and first_embed.author.name
+                        and SHINY_PATTERN.search(first_embed.author.name)
+                    ):
                         logger.info(
                             f"✨ Shiny detected in {message.guild.name}#{message.channel.name}! "
-                            f"Embed title: {first_embed.title}"
+                            f"Author name: {first_embed.author.name}"
                         )
 
                         # Build notification message from config
@@ -826,6 +902,114 @@ async def uptime(interaction: discord.Interaction):
         await interaction.response.send_message(
             "⏰ Uptime tracking not available.", ephemeral=True
         )
+
+
+@bot.tree.command(
+    name="debug-message",
+    description="Debug the last message from target user (Owner only)",
+)
+async def debug_message(interaction: discord.Interaction):
+    """Debug shiny detection by showing ALL embed fields"""
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Owner only!", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Get last 50 messages
+    messages = []
+    async for msg in interaction.channel.history(limit=50):
+        if msg.author.id == TARGET_USER_ID:
+            messages.append(msg)
+
+    if not messages:
+        await interaction.followup.send(
+            "No messages from target user found!", ephemeral=True
+        )
+        return
+
+    last_msg = messages[0]
+
+    debug_info = [
+        "**Last Message from Target User**",
+        f"Author: {last_msg.author.name} (ID: {last_msg.author.id})",
+        f"Message ID: {last_msg.id}",
+        f"Channel: #{last_msg.channel.name}",
+        "",
+        f"**Embeds:** {len(last_msg.embeds)}",
+    ]
+
+    if last_msg.embeds:
+        for idx, embed in enumerate(last_msg.embeds):
+            debug_info.append("")
+            debug_info.append(f"**═══ Embed {idx + 1} ═══**")
+
+            # Check TITLE
+            debug_info.append(f"**Title:** `{embed.title}`")
+
+            # Check AUTHOR (THIS IS PROBABLY WHERE IT IS!)
+            if embed.author:
+                debug_info.append(f"**Author Name:** `{embed.author.name}`")
+                debug_info.append(f"**Author Icon:** {embed.author.icon_url or 'None'}")
+                debug_info.append(f"**Author URL:** {embed.author.url or 'None'}")
+
+            # Check DESCRIPTION
+            if embed.description:
+                desc_preview = embed.description[:100]
+                debug_info.append(f"**Description:** `{desc_preview}...`")
+
+            # Check FOOTER
+            if embed.footer:
+                debug_info.append(f"**Footer Text:** `{embed.footer.text}`")
+
+            # Check FIELDS
+            if embed.fields:
+                debug_info.append(f"**Fields ({len(embed.fields)}):**")
+                for field in embed.fields:
+                    debug_info.append(f"  - {field.name}: {field.value[:50]}")
+
+            # Check COLOR
+            debug_info.append(f"**Color:** {embed.color}")
+
+            # Check IMAGE
+            if embed.image:
+                debug_info.append(f"**Image URL:** {embed.image.url[:50]}...")
+
+            # Check THUMBNAIL
+            if embed.thumbnail:
+                debug_info.append(f"**Thumbnail URL:** {embed.thumbnail.url[:50]}...")
+
+            debug_info.append("")
+            debug_info.append("**🔍 PATTERN TESTS:**")
+
+            # Test pattern on TITLE
+            if embed.title:
+                match = SHINY_PATTERN.search(embed.title)
+                debug_info.append(f"Title match: `{match is not None}`")
+
+            # Test pattern on AUTHOR.NAME (THIS IS KEY!)
+            if embed.author and embed.author.name:
+                match = SHINY_PATTERN.search(embed.author.name)
+                debug_info.append(f"**Author.name match: `{match is not None}`**")
+                if match:
+                    debug_info.append(f"**✅ MATCHED IN AUTHOR: `{match.group()}`**")
+
+            # Test pattern on DESCRIPTION
+            if embed.description:
+                match = SHINY_PATTERN.search(embed.description)
+                debug_info.append(f"Description match: `{match is not None}`")
+    else:
+        debug_info.append("No embeds!")
+
+    # Send in chunks if too long
+    full_text = "\n".join(debug_info)
+    if len(full_text) > 2000:
+        chunks = [full_text[i : i + 2000] for i in range(0, len(full_text), 2000)]
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True)
+    else:
+        await interaction.followup.send(full_text, ephemeral=True)
 
 
 # Load cogs
