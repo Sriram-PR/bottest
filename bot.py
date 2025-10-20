@@ -863,13 +863,34 @@ async def help_command(ctx: commands.Context):
 @bot.hybrid_command(name="ping", description="Check bot latency and response time")
 async def ping(ctx: commands.Context):
     """Check bot's latency"""
-    latency = round(bot.latency * 1000)
-    message = f"🏓 Pong! **{latency}ms**"
+    import time
 
+    # Measure API response time
+    start_time = time.perf_counter()
+
+    # WebSocket latency
+    ws_latency = round(bot.latency * 1000, 2)
+
+    # Send message and measure
     if ctx.interaction:
-        await ctx.send(message, ephemeral=True)
+        await ctx.defer()
+        msg = await ctx.send("Calculating...")
     else:
-        await ctx.send(message)
+        msg = await ctx.send("Calculating...")
+
+    # Calculate API response time
+    api_latency = round((time.perf_counter() - start_time) * 1000, 2)
+
+    # Update with results
+    embed = discord.Embed(color=0x2B2D31)  # Discord dark theme color
+    embed.add_field(
+        name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
+    )
+    embed.add_field(
+        name="API Response Time", value=f"```{api_latency} ms```", inline=True
+    )
+
+    await msg.edit(content=None, embed=embed)
 
 
 @bot.tree.command(name="uptime", description="Check bot uptime (Developer only)")
