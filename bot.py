@@ -17,7 +17,6 @@ from config.settings import (
     OWNER_ID,
     SHINY_CONFIG_FILE,
     SHINY_NOTIFICATION_MESSAGE,
-    SHINY_NOTIFICATION_PING_ROLE,
     TARGET_USER_ID,
 )
 
@@ -37,8 +36,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
-# Shiny detection pattern - more robust than hardcoded Unicode
+# Shiny detection patterns
 SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*\u2605", re.UNICODE)
+FOOTER_PATTERN = re.compile(r"(.+?)#0\s*\|\s*(.+?)\s*\|")
+
+# Pre-built notification message (optimization: built once at startup)
+NOTIFICATION_CACHE = SHINY_NOTIFICATION_MESSAGE
 
 
 class GuildShinyConfig:
@@ -73,6 +76,10 @@ class SmogonBot(commands.Bot):
         self.start_time: Optional[float] = None
         # Per-guild configurations
         self.shiny_configs: Dict[int, GuildShinyConfig] = {}
+        # Per-channel detection mode tracking
+        # "author" = check author.name for "Vs. ★"
+        # "footer" = check footer for catch result
+        self.shiny_detection_mode: Dict[int, str] = {}
 
     async def setup_hook(self):
         """Called when bot is starting up - for async initialization"""
@@ -138,7 +145,6 @@ def load_shiny_configs() -> Dict[int, GuildShinyConfig]:
                     logger.warning(
                         "Old configuration format detected - migrating to per-guild format"
                     )
-                    # Old global format - will need manual guild assignment
                     return {}
 
                 # New per-guild format
@@ -197,7 +203,6 @@ def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
                 logger.debug(f"Created backup: {backup_file}")
             except Exception as e:
                 logger.warning(f"Could not create backup: {e}")
-                # Continue anyway - backup is optional
 
         # Atomic write: write to temp file first, then rename
         temp_file = SHINY_CONFIG_FILE.with_suffix(".json.tmp")
@@ -209,7 +214,7 @@ def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
 
             # Validate JSON is readable before replacing original
             with open(temp_file, "r") as f:
-                json.load(f)  # This will raise JSONDecodeError if corrupted
+                json.load(f)
 
             # Atomic rename (replaces original file)
             temp_file.replace(SHINY_CONFIG_FILE)
@@ -219,7 +224,6 @@ def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
 
         except json.JSONDecodeError as e:
             logger.error(f"❌ Generated invalid JSON: {e}")
-            # Don't replace the original file with broken JSON
             if temp_file.exists():
                 temp_file.unlink()
             return False
@@ -232,6 +236,56 @@ def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
     except Exception as e:
         logger.error(f"Error saving shiny configurations: {e}", exc_info=True)
         return False
+
+
+async def forward_shiny_to_archive(
+    bot: SmogonBot,
+    guild_config: GuildShinyConfig,
+    embed_to_archive: discord.Embed,
+    message: discord.Message,
+):
+    """
+    Forward shiny embed to archive channel (background task)
+
+    This runs independently and doesn't block the main notification.
+    Combines embed and jump link into a single API call for efficiency.
+    """
+    try:
+        archive_channel = bot.get_channel(guild_config.embed_channel_id)
+
+        if not archive_channel:
+            logger.warning(
+                f"Archive channel {guild_config.embed_channel_id} not found "
+                f"in {message.guild.name} (may have been deleted)"
+            )
+            return
+
+        # Create jump link
+        jump_link = (
+            f"https://discord.com/channels/{message.guild.id}/"
+            f"{message.channel.id}/{message.id}"
+        )
+
+        # Send embed and jump link in ONE API call (optimization)
+        await archive_channel.send(
+            content=f"Jump to message: {jump_link}", embed=embed_to_archive
+        )
+
+        # Log after successful send (moved to background)
+        logger.info(
+            f"Forwarded shiny embed to archive channel {archive_channel.name} "
+            f"in {message.guild.name}"
+        )
+
+    except discord.Forbidden:
+        logger.error(
+            f"No permission to send in archive channel "
+            f"{guild_config.embed_channel_id} in {message.guild.name}"
+        )
+    except discord.HTTPException as e:
+        logger.error(f"HTTP error forwarding to archive: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error forwarding to archive: {e}", exc_info=True)
 
 
 @bot.event
@@ -299,162 +353,98 @@ async def on_message(message: discord.Message):
                     f"   Channel: #{message.channel.name} (ID: {message.channel.id})"
                 )
                 logger.debug(f"   Message ID: {message.id}")
-                logger.debug(
-                    f"   Content: {message.content[:100] if message.content else 'No text content'}"
-                )
-
-                # Get guild-specific configuration
-                guild_config = bot.shiny_configs.get(message.guild.id)
-
-                logger.debug(f"   Guild has config: {guild_config is not None}")
-                if guild_config:
-                    logger.debug(f"   Monitored channels: {guild_config.channels}")
-                    logger.debug(
-                        f"   Current channel monitored: {message.channel.id in guild_config.channels}"
-                    )
-
-                # Check embeds
                 logger.debug(f"   Number of embeds: {len(message.embeds)}")
+
+                # Show current detection mode for this channel
+                current_mode = bot.shiny_detection_mode.get(
+                    message.channel.id, "author"
+                )
+                logger.debug(f"   Detection mode: {current_mode.upper()}")
 
                 if message.embeds:
                     for idx, embed in enumerate(message.embeds):
                         logger.debug(f"   --- Embed {idx + 1} ---")
-
-                        # Focus on AUTHOR field (where the pattern actually is)
-                        if embed.author:
-                            logger.debug("   ✅ Embed has author field!")
+                        if embed.author and embed.author.name:
                             logger.debug(f"   Author Name: '{embed.author.name}'")
-                            logger.debug(
-                                f"   Author Name type: {type(embed.author.name)}"
-                            )
-                            logger.debug(
-                                f"   Author Name length: {len(embed.author.name) if embed.author.name else 0}"
-                            )
-                            logger.debug(
-                                f"   Author Name repr: {repr(embed.author.name)}"
-                            )
-
-                            # Test pattern matching on author.name
-                            if embed.author.name:
-                                pattern_match = SHINY_PATTERN.search(embed.author.name)
-                                logger.debug(
-                                    f"   🔍 Pattern match on author.name: {pattern_match}"
-                                )
-                                if pattern_match:
-                                    logger.debug(
-                                        f"   ✅ PATTERN MATCHED IN AUTHOR.NAME! Match: {pattern_match.group()}"
-                                    )
-                                else:
-                                    logger.debug(
-                                        "   ❌ Pattern did NOT match author.name"
-                                    )
-                                    # Show character codes
-                                    logger.debug(
-                                        f"   Author name character codes: {[hex(ord(c)) for c in embed.author.name[:50]]}"
-                                    )
-                        else:
-                            logger.debug("   ⚠️ Embed has NO author field!")
-
-                        # Log other fields for reference
-                        logger.debug(f"   Title: '{embed.title}'")
-                        logger.debug(
-                            f"   Description: {embed.description[:100] if embed.description else 'None'}"
-                        )
-                        logger.debug(f"   Color: {embed.color}")
-                        logger.debug(
-                            f"   Image URL: {embed.image.url if embed.image else 'None'}"
-                        )
-                else:
-                    logger.debug("   ⚠️ No embeds in message!")
+                        if embed.footer and embed.footer.text:
+                            logger.debug(f"   Footer Text: '{embed.footer.text}'")
 
                 logger.debug("=" * 60)
 
-            # ACTUAL DETECTION LOGIC - Check author.name only!
+            # OPTIMIZED STATE-BASED DETECTION LOGIC
+            # Early exit if no embeds
+            if not message.embeds:
+                await bot.process_commands(message)
+                return
+
+            first_embed = message.embeds[0]
+            channel_id = message.channel.id
+
+            # Get current detection mode for this channel (default: "author")
+            current_mode = bot.shiny_detection_mode.get(channel_id, "author")
+
+            # Only check config if in monitored channel
             guild_config = bot.shiny_configs.get(message.guild.id)
 
-            if guild_config and message.channel.id in guild_config.channels:
-                # Check if message has embeds
-                if message.embeds:
-                    first_embed = message.embeds[0]
+            if not (guild_config and channel_id in guild_config.channels):
+                await bot.process_commands(message)
+                return
 
-                    # Check for pattern in embed.author.name (NOT title!)
-                    if (
-                        first_embed.author
-                        and first_embed.author.name
-                        and SHINY_PATTERN.search(first_embed.author.name)
-                    ):
-                        logger.info(
-                            f"✨ Shiny detected in {message.guild.name}#{message.channel.name}! "
-                            f"Author name: {first_embed.author.name}"
+            # STATE-BASED DETECTION (optimization: only check one field at a time)
+
+            if current_mode == "author":
+                # AUTHOR MODE: Check author.name for shiny battle start
+                if not (first_embed.author and first_embed.author.name):
+                    await bot.process_commands(message)
+                    return
+
+                # Check for shiny pattern in author.name
+                if SHINY_PATTERN.search(first_embed.author.name):
+                    # SHINY DETECTED! Send notification immediately
+                    await message.channel.send(NOTIFICATION_CACHE)
+
+                    # Log after sending (optimization: moved after send)
+                    logger.info(
+                        f"✨ Shiny battle detected in {message.guild.name}#{message.channel.name}! "
+                        f"Author: {first_embed.author.name}"
+                    )
+
+                    # Switch to FOOTER mode for next message
+                    bot.shiny_detection_mode[channel_id] = "footer"
+                    logger.debug(f"Switched channel {channel_id} to FOOTER mode")
+
+                    # Forward to archive (FIRE-AND-FORGET - don't wait)
+                    if guild_config.embed_channel_id:
+                        asyncio.create_task(
+                            forward_shiny_to_archive(
+                                bot, guild_config, first_embed, message
+                            )
                         )
 
-                        # Build notification message from config
-                        notification_message = SHINY_NOTIFICATION_MESSAGE
+            elif current_mode == "footer":
+                # FOOTER MODE: Check footer to reset state (no notification/archive)
+                if not (first_embed.footer and first_embed.footer.text):
+                    await bot.process_commands(message)
+                    return
 
-                        # Add role ping if configured
-                        if SHINY_NOTIFICATION_PING_ROLE:
-                            notification_message = f"<@&{SHINY_NOTIFICATION_PING_ROLE}>\n{notification_message}"
+                # Check for catch pattern in footer
+                footer_match = FOOTER_PATTERN.search(first_embed.footer.text)
 
-                        # Send notification to THE SAME CHANNEL where shiny was found
-                        try:
-                            await message.channel.send(notification_message)
-                            logger.info(
-                                f"Posted shiny notification to {message.channel.name}"
-                            )
-                        except discord.Forbidden:
-                            logger.error(
-                                f"No permission to send in channel {message.channel.id}"
-                            )
-                        except discord.HTTPException as e:
-                            logger.error(f"HTTP error sending notification: {e}")
-                        except Exception as e:
-                            logger.error(
-                                f"Unexpected error sending notification: {e}",
-                                exc_info=True,
-                            )
+                if footer_match:
+                    route_info = footer_match.group(2).strip()
 
-                        # Forward embed to archive channel if configured for this guild
-                        if guild_config.embed_channel_id:
-                            try:
-                                archive_channel = bot.get_channel(
-                                    guild_config.embed_channel_id
-                                )
-                                if archive_channel:
-                                    # Create jump link
-                                    jump_link = (
-                                        f"https://discord.com/channels/{message.guild.id}/"
-                                        f"{message.channel.id}/{message.id}"
-                                    )
-
-                                    # Send the original embed
-                                    await archive_channel.send(embed=first_embed)
-
-                                    # Send jump link
-                                    await archive_channel.send(
-                                        f"Jump to message: {jump_link}"
-                                    )
-
-                                    logger.info(
-                                        f"Forwarded shiny embed to archive channel {archive_channel.name} "
-                                        f"in {message.guild.name}"
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"Archive channel {guild_config.embed_channel_id} not found "
-                                        f"in {message.guild.name} (may have been deleted)"
-                                    )
-                            except discord.Forbidden:
-                                logger.error(
-                                    f"No permission to send in archive channel "
-                                    f"{guild_config.embed_channel_id} in {message.guild.name}"
-                                )
-                            except discord.HTTPException as e:
-                                logger.error(f"HTTP error forwarding to archive: {e}")
-                            except Exception as e:
-                                logger.error(
-                                    f"Unexpected error forwarding to archive: {e}",
-                                    exc_info=True,
-                                )
+                    # Verify route information exists
+                    if "Route " in route_info:
+                        # Footer detected - silently switch back to AUTHOR mode
+                        bot.shiny_detection_mode[channel_id] = "author"
+                        logger.debug(
+                            f"Footer detected, switched channel {channel_id} back to AUTHOR mode"
+                        )
+                    else:
+                        # Footer found but no route info, stay in footer mode
+                        logger.debug(
+                            f"Footer pattern matched but no 'Route ' found in: {route_info}"
+                        )
 
     except Exception as e:
         # Log error but don't crash the bot
@@ -470,7 +460,6 @@ async def on_guild_join(guild: discord.Guild):
     logger.info(
         f"✅ Joined guild: {guild.name} (ID: {guild.id}, Members: {guild.member_count})"
     )
-    # Create empty config for new guild
     bot.get_guild_config(guild.id)
 
 
@@ -478,7 +467,6 @@ async def on_guild_join(guild: discord.Guild):
 async def on_guild_remove(guild: discord.Guild):
     """Called when bot is removed from a guild"""
     logger.info(f"❌ Removed from guild: {guild.name} (ID: {guild.id})")
-    # Optionally remove guild config
     if guild.id in bot.shiny_configs:
         del bot.shiny_configs[guild.id]
         save_shiny_configs(bot.shiny_configs)
@@ -489,11 +477,9 @@ async def on_guild_remove(guild: discord.Guild):
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     """Global error handler for prefix commands"""
 
-    # Ignore command not found errors
     if isinstance(error, commands.CommandNotFound):
         return
 
-    # Handle specific error types
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(
             f"⏱️ This command is on cooldown. Try again in **{error.retry_after:.1f}s**",
@@ -528,7 +514,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
             "❌ You don't have permission to use this command!", delete_after=15
         )
     else:
-        # Log unexpected errors
         logger.error(
             f"Unexpected error in command '{ctx.command}': {error}", exc_info=error
         )
@@ -543,13 +528,11 @@ async def on_app_command_error(
 ):
     """Global error handler for slash commands"""
 
-    # Determine send method based on interaction state
     if interaction.response.is_done():
         send_method = interaction.followup.send
     else:
         send_method = interaction.response.send_message
 
-    # Handle specific error types
     if isinstance(error, discord.app_commands.CommandOnCooldown):
         error_message = (
             f"⏱️ This command is on cooldown. Try again in **{error.retry_after:.1f}s**"
@@ -596,25 +579,20 @@ async def shiny_channel(
 ):
     """Manage channels to monitor for shiny Pokemon in this server"""
 
-    # Check if user is owner
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message(
             "❌ This command is only available to the bot owner.", ephemeral=True
         )
         return
 
-    # Must be used in a guild
     if not interaction.guild:
         await interaction.response.send_message(
             "❌ This command can only be used in a server.", ephemeral=True
         )
         return
 
-    # Get guild-specific configuration
     guild_config = bot.get_guild_config(interaction.guild.id)
     action_value = action.value
-
-    # Use provided channel or current channel
     target_channel = channel or interaction.channel
 
     if action_value == "add":
@@ -625,6 +603,8 @@ async def shiny_channel(
             )
         else:
             guild_config.channels.add(target_channel.id)
+            # Initialize channel to author mode
+            bot.shiny_detection_mode[target_channel.id] = "author"
             save_shiny_configs(bot.shiny_configs)
             await interaction.response.send_message(
                 f"✅ Added {target_channel.mention} to shiny monitoring in **{interaction.guild.name}**.\n"
@@ -644,6 +624,9 @@ async def shiny_channel(
             )
         else:
             guild_config.channels.remove(target_channel.id)
+            # Remove channel mode tracking
+            if target_channel.id in bot.shiny_detection_mode:
+                del bot.shiny_detection_mode[target_channel.id]
             save_shiny_configs(bot.shiny_configs)
             await interaction.response.send_message(
                 f"✅ Removed {target_channel.mention} from shiny monitoring in **{interaction.guild.name}**.\n"
@@ -672,8 +655,11 @@ async def shiny_channel(
             channel_list = []
             for channel_id in guild_config.channels:
                 channel_obj = bot.get_channel(channel_id)
+                mode = bot.shiny_detection_mode.get(channel_id, "author")
                 if channel_obj:
-                    channel_list.append(f"• {channel_obj.mention} (`{channel_id}`)")
+                    channel_list.append(
+                        f"• {channel_obj.mention} (`{channel_id}`) - Mode: {mode}"
+                    )
                 else:
                     channel_list.append(
                         f"• Unknown Channel (`{channel_id}`) - May have been deleted"
@@ -715,6 +701,10 @@ async def shiny_channel(
 
     elif action_value == "clear":
         count = len(guild_config.channels)
+        # Clear mode tracking for all channels
+        for channel_id in guild_config.channels:
+            if channel_id in bot.shiny_detection_mode:
+                del bot.shiny_detection_mode[channel_id]
         guild_config.channels.clear()
         save_shiny_configs(bot.shiny_configs)
         await interaction.response.send_message(
@@ -727,7 +717,6 @@ async def shiny_channel(
         )
 
 
-# Shiny Archive Channel Management (Developer Only)
 @bot.tree.command(
     name="shiny-archive",
     description="Manage shiny archive channel for this server (Developer only)",
@@ -750,28 +739,23 @@ async def shiny_archive(
 ):
     """Manage archive channel where shiny embeds are forwarded in this server"""
 
-    # Check if user is owner
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message(
             "❌ This command is only available to the bot owner.", ephemeral=True
         )
         return
 
-    # Must be used in a guild
     if not interaction.guild:
         await interaction.response.send_message(
             "❌ This command can only be used in a server.", ephemeral=True
         )
         return
 
-    # Get guild-specific configuration
     guild_config = bot.get_guild_config(interaction.guild.id)
     action_value = action.value
 
     if action_value == "set":
-        # Use provided channel or current channel
         target_channel = channel or interaction.channel
-
         guild_config.embed_channel_id = target_channel.id
         save_shiny_configs(bot.shiny_configs)
 
@@ -842,7 +826,6 @@ async def shiny_archive(
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# Help command
 @bot.hybrid_command(name="help", description="Show bot commands and usage")
 async def help_command(ctx: commands.Context):
     """Display help information"""
@@ -877,7 +860,6 @@ async def help_command(ctx: commands.Context):
         await ctx.response.send_message(embed=embed)
 
 
-# Ping command
 @bot.hybrid_command(name="ping", description="Check bot latency and response time")
 async def ping(ctx: commands.Context):
     """Check bot's latency"""
@@ -890,19 +872,16 @@ async def ping(ctx: commands.Context):
         await ctx.send(message)
 
 
-# Uptime command (Developer only, slash command only)
 @bot.tree.command(name="uptime", description="Check bot uptime (Developer only)")
 async def uptime(interaction: discord.Interaction):
     """Check bot's uptime - Developer only"""
 
-    # Check if user is the owner
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message(
             "❌ This command is only available to the bot owner.", ephemeral=True
         )
         return
 
-    # Calculate uptime
     if bot.start_time:
         uptime_seconds = int(time.time() - bot.start_time)
 
@@ -910,7 +889,6 @@ async def uptime(interaction: discord.Interaction):
         hours, remainder = divmod(remainder, 3600)
         minutes, seconds = divmod(remainder, 60)
 
-        # Build uptime string
         uptime_parts = []
         if days > 0:
             uptime_parts.append(f"{days}d")
@@ -922,12 +900,10 @@ async def uptime(interaction: discord.Interaction):
 
         uptime_str = " ".join(uptime_parts)
 
-        # Get additional stats
         guild_count = len(bot.guilds)
         user_count = sum(g.member_count for g in bot.guilds if g.member_count)
         latency = round(bot.latency * 1000)
 
-        # Get shiny monitoring stats
         total_monitored = sum(
             len(config.channels) for config in bot.shiny_configs.values()
         )
@@ -950,7 +926,6 @@ async def uptime(interaction: discord.Interaction):
             inline=True,
         )
 
-        # Add shiny monitoring stats
         if TARGET_USER_ID:
             embed.add_field(
                 name="🌟 Shiny Monitoring",
@@ -984,7 +959,6 @@ async def debug_message(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    # Get last 50 messages
     messages = []
     async for msg in interaction.channel.history(limit=50):
         if msg.author.id == TARGET_USER_ID:
@@ -998,11 +972,15 @@ async def debug_message(interaction: discord.Interaction):
 
     last_msg = messages[0]
 
+    # Show current detection mode
+    current_mode = bot.shiny_detection_mode.get(interaction.channel.id, "author")
+
     debug_info = [
         "**Last Message from Target User**",
         f"Author: {last_msg.author.name} (ID: {last_msg.author.id})",
         f"Message ID: {last_msg.id}",
         f"Channel: #{last_msg.channel.name}",
+        f"**Current Detection Mode:** {current_mode.upper()}",
         "",
         f"**Embeds:** {len(last_msg.embeds)}",
     ]
@@ -1011,65 +989,30 @@ async def debug_message(interaction: discord.Interaction):
         for idx, embed in enumerate(last_msg.embeds):
             debug_info.append("")
             debug_info.append(f"**═══ Embed {idx + 1} ═══**")
-
-            # Check TITLE
             debug_info.append(f"**Title:** `{embed.title}`")
 
-            # Check AUTHOR (THIS IS PROBABLY WHERE IT IS!)
             if embed.author:
                 debug_info.append(f"**Author Name:** `{embed.author.name}`")
-                debug_info.append(f"**Author Icon:** {embed.author.icon_url or 'None'}")
-                debug_info.append(f"**Author URL:** {embed.author.url or 'None'}")
+                pattern_match = SHINY_PATTERN.search(embed.author.name)
+                debug_info.append(f"Shiny pattern match: `{pattern_match is not None}`")
 
-            # Check DESCRIPTION
+            if embed.footer:
+                debug_info.append(f"**Footer Text:** `{embed.footer.text}`")
+                footer_match = FOOTER_PATTERN.search(embed.footer.text)
+                debug_info.append(f"Footer pattern match: `{footer_match is not None}`")
+                if footer_match:
+                    debug_info.append(f"Username: `{footer_match.group(1)}`")
+                    debug_info.append(f"Route info: `{footer_match.group(2)}`")
+
             if embed.description:
                 desc_preview = embed.description[:100]
                 debug_info.append(f"**Description:** `{desc_preview}...`")
 
-            # Check FOOTER
-            if embed.footer:
-                debug_info.append(f"**Footer Text:** `{embed.footer.text}`")
-
-            # Check FIELDS
-            if embed.fields:
-                debug_info.append(f"**Fields ({len(embed.fields)}):**")
-                for field in embed.fields:
-                    debug_info.append(f"  - {field.name}: {field.value[:50]}")
-
-            # Check COLOR
-            debug_info.append(f"**Color:** {embed.color}")
-
-            # Check IMAGE
             if embed.image:
                 debug_info.append(f"**Image URL:** {embed.image.url[:50]}...")
-
-            # Check THUMBNAIL
-            if embed.thumbnail:
-                debug_info.append(f"**Thumbnail URL:** {embed.thumbnail.url[:50]}...")
-
-            debug_info.append("")
-            debug_info.append("**🔍 PATTERN TESTS:**")
-
-            # Test pattern on TITLE
-            if embed.title:
-                match = SHINY_PATTERN.search(embed.title)
-                debug_info.append(f"Title match: `{match is not None}`")
-
-            # Test pattern on AUTHOR.NAME (THIS IS KEY!)
-            if embed.author and embed.author.name:
-                match = SHINY_PATTERN.search(embed.author.name)
-                debug_info.append(f"**Author.name match: `{match is not None}`**")
-                if match:
-                    debug_info.append(f"**✅ MATCHED IN AUTHOR: `{match.group()}`**")
-
-            # Test pattern on DESCRIPTION
-            if embed.description:
-                match = SHINY_PATTERN.search(embed.description)
-                debug_info.append(f"Description match: `{match is not None}`")
     else:
         debug_info.append("No embeds!")
 
-    # Send in chunks if too long
     full_text = "\n".join(debug_info)
     if len(full_text) > 2000:
         chunks = [full_text[i : i + 2000] for i in range(0, len(full_text), 2000)]
@@ -1079,7 +1022,6 @@ async def debug_message(interaction: discord.Interaction):
         await interaction.followup.send(full_text, ephemeral=True)
 
 
-# Load cogs
 async def load_cogs():
     """Load all bot cogs"""
     cogs = ["cogs.smogon"]

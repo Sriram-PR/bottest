@@ -49,7 +49,6 @@ SHINY_NOTIFICATION_MESSAGE = os.getenv(
     "SHINY_NOTIFICATION_MESSAGE",
     "🌟 **SHINY POKEMON DETECTED!** 🌟\nA wild shiny has appeared!",
 )
-SHINY_NOTIFICATION_PING_ROLE = os.getenv("SHINY_NOTIFICATION_PING_ROLE", "")
 
 # Data Storage
 DATA_DIR = Path("data")
@@ -149,7 +148,7 @@ FORMATS_BY_GEN = {
     "gen9": [
         "ou",
         "ubers",
-        "nationaldex",  # ✅ FIXED: Added for Tapu-Bulu and other past-gen Pokemon
+        "nationaldex",
         "uu",
         "doublesou",
         "ru",
