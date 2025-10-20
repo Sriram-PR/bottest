@@ -11,14 +11,20 @@ import discord
 from discord.ext import commands
 
 from config.settings import (
+    CACHE_TIMEOUT,
     COMMAND_PREFIX,
     DISCORD_TOKEN,
     LOG_LEVEL,
     OWNER_ID,
+    RATE_LIMIT_CLEANUP_INTERVAL,
+    RATE_LIMIT_ENABLED,
+    RATE_LIMIT_MAX_REQUESTS,
+    RATE_LIMIT_WINDOW,
     SHINY_CONFIG_FILE,
     SHINY_NOTIFICATION_MESSAGE,
     TARGET_USER_ID,
 )
+from utils.rate_limiter import UserRateLimiter
 
 # Setup logging with configurable level
 logging.basicConfig(
@@ -36,9 +42,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
-# Shiny detection pattern
-# SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*\u2605", re.UNICODE)
-SHINY_PATTERN = re.compile(r"Vs\.[\s\u200B]*", re.UNICODE)
+# Shiny detection pattern - checks embed description for "A wild **LvX ★"
+SHINY_PATTERN = re.compile(
+    r"A\s+wild\s+\*\*Lv\d+\s+★",  # Matches: A wild **Lv4 ★, A wild **Lv50 ★, etc.
+    re.UNICODE | re.IGNORECASE,
+)
 
 # Pre-built notification message (optimization: built once at startup)
 NOTIFICATION_CACHE = SHINY_NOTIFICATION_MESSAGE
@@ -76,6 +84,8 @@ class SmogonBot(commands.Bot):
         self.start_time: Optional[float] = None
         # Per-guild configurations
         self.shiny_configs: Dict[int, GuildShinyConfig] = {}
+        # Rate limiter cleanup task
+        self._rate_limit_cleanup_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self):
         """Called when bot is starting up - for async initialization"""
@@ -96,9 +106,25 @@ class SmogonBot(commands.Bot):
         logger.info(f"Total monitored channels: {total_channels}")
         logger.info(f"Guilds with archive channels: {total_archives}")
 
+        # Start rate limiter cleanup task
+        if RATE_LIMIT_ENABLED:
+            self._rate_limit_cleanup_task = asyncio.create_task(
+                self._rate_limit_cleanup_loop()
+            )
+            logger.info("Started rate limiter cleanup task")
+
     async def close(self):
         """Override close to ensure proper cleanup of resources"""
         logger.info("Bot shutdown initiated - cleaning up resources")
+
+        # Cancel rate limiter cleanup task
+        if self._rate_limit_cleanup_task and not self._rate_limit_cleanup_task.done():
+            self._rate_limit_cleanup_task.cancel()
+            try:
+                await self._rate_limit_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Cancelled rate limiter cleanup task")
 
         # Save shiny configurations before shutdown
         save_shiny_configs(self.shiny_configs)
@@ -123,9 +149,31 @@ class SmogonBot(commands.Bot):
             logger.info(f"Created new configuration for guild {guild_id}")
         return self.shiny_configs[guild_id]
 
+    async def _rate_limit_cleanup_loop(self):
+        """Background task to periodically clean up rate limiter data"""
+        while True:
+            try:
+                await asyncio.sleep(RATE_LIMIT_CLEANUP_INTERVAL)
+                global_rate_limiter.cleanup_expired()
+                logger.debug("Rate limiter cleanup completed")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in rate limiter cleanup: {e}", exc_info=True)
+
 
 # Create bot instance
 bot = SmogonBot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+
+# Initialize global rate limiter
+if RATE_LIMIT_ENABLED:
+    global_rate_limiter = UserRateLimiter(
+        max_requests=RATE_LIMIT_MAX_REQUESTS, window=RATE_LIMIT_WINDOW
+    )
+    logger.info("Global rate limiter initialized")
+else:
+    global_rate_limiter = None
+    logger.info("Rate limiting disabled")
 
 
 # Helper functions for shiny configuration persistence
@@ -354,14 +402,20 @@ async def on_message(message: discord.Message):
                 if message.embeds:
                     for idx, embed in enumerate(message.embeds):
                         logger.debug(f"   --- Embed {idx + 1} ---")
-                        if embed.author and embed.author.name:
-                            pattern_match = SHINY_PATTERN.search(embed.author.name)
-                            logger.debug(f"   Author Name: '{embed.author.name}'")
+
+                        # Check description for shiny pattern
+                        if embed.description:
+                            pattern_match = SHINY_PATTERN.search(embed.description)
                             logger.debug(
-                                f"   Pattern match: {pattern_match is not None}"
+                                f"   Description (first 150 chars): '{embed.description[:150]}'"
+                            )
+                            logger.debug(
+                                f"   Pattern match in description: {pattern_match is not None}"
                             )
                             if pattern_match:
-                                logger.debug(f"   ✅ MATCHED! {pattern_match.group()}")
+                                logger.debug(
+                                    f"   ✅ MATCHED! '{pattern_match.group()}'"
+                                )
 
                 logger.debug("=" * 60)
 
@@ -373,11 +427,10 @@ async def on_message(message: discord.Message):
 
             first_embed = message.embeds[0]
 
-            # Early pattern check (before config lookup - optimization)
+            # Check description for shiny pattern (before config lookup - optimization)
             if not (
-                first_embed.author
-                and first_embed.author.name
-                and SHINY_PATTERN.search(first_embed.author.name)
+                first_embed.description
+                and SHINY_PATTERN.search(first_embed.description)
             ):
                 await bot.process_commands(message)
                 return
@@ -404,7 +457,6 @@ async def on_message(message: discord.Message):
                             bot, guild_config, first_embed, message
                         )
                     )
-                    # Returns immediately! User doesn't wait for archive
 
     except Exception as e:
         # Log error but don't crash the bot
@@ -515,7 +567,331 @@ async def on_app_command_error(
         logger.error(f"Failed to send error message: {e}", exc_info=e)
 
 
-# Shiny Channel Management Commands (Developer Only)
+# ========================================
+# CACHE STATS COMMANDS
+# ========================================
+
+
+@bot.tree.command(
+    name="cache-stats", description="View API cache statistics (Developer only)"
+)
+async def cache_stats(interaction: discord.Interaction):
+    """View cache performance statistics - Developer only"""
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ This command is only available to the bot owner.", ephemeral=True
+        )
+        return
+
+    # Get Smogon cog
+    smogon_cog = bot.get_cog("Smogon")
+    if not smogon_cog or not hasattr(smogon_cog, "api_client"):
+        await interaction.response.send_message(
+            "❌ API client not available.", ephemeral=True
+        )
+        return
+
+    api_client = smogon_cog.api_client
+    stats = api_client.get_cache_stats()
+
+    # Create embed
+    embed = discord.Embed(
+        title="📊 API Cache Statistics",
+        description="Performance metrics for API caching system",
+        color=0x00CED1,
+        timestamp=interaction.created_at,
+    )
+
+    # Cache size with progress bar
+    size_percent = (stats["size"] / stats["max_size"]) * 100
+    size_bar = "█" * int(size_percent / 10) + "░" * (10 - int(size_percent / 10))
+
+    embed.add_field(
+        name="💾 Cache Size",
+        value=(
+            f"```{stats['size']:,} / {stats['max_size']:,} entries```\n"
+            f"{size_bar} **{size_percent:.1f}%**"
+        ),
+        inline=False,
+    )
+
+    # Hit rate with emoji indicator
+    hit_rate_value = float(stats["hit_rate"].rstrip("%"))
+    if hit_rate_value >= 70:
+        hit_rate_emoji = "🟢"
+        performance = "Excellent"
+    elif hit_rate_value >= 40:
+        hit_rate_emoji = "🟡"
+        performance = "Good"
+    else:
+        hit_rate_emoji = "🔴"
+        performance = "Poor"
+
+    embed.add_field(
+        name=f"{hit_rate_emoji} Hit Rate",
+        value=(
+            f"```{stats['hit_rate']}```\n"
+            f"**Performance:** {performance}\n"
+            f"Hits: {stats['hits']:,} | Misses: {stats['misses']:,}"
+        ),
+        inline=True,
+    )
+
+    # Total requests
+    total = stats["hits"] + stats["misses"]
+    embed.add_field(
+        name="📈 Total Requests", value=f"```{total:,} requests```", inline=True
+    )
+
+    # Performance interpretation
+    if hit_rate_value >= 70:
+        interpretation = (
+            "🟢 **Excellent Performance**\n"
+            "Cache is working optimally. Most requests are served from cache, "
+            "reducing API load significantly."
+        )
+    elif hit_rate_value >= 40:
+        interpretation = (
+            "🟡 **Good Performance**\n"
+            "Cache is working well, but there's room for improvement. "
+            "Consider increasing cache size or timeout."
+        )
+    else:
+        interpretation = (
+            "🔴 **Needs Improvement**\n"
+            "Low hit rate suggests cache isn't effective. This could be due to:\n"
+            "• Users querying diverse Pokemon\n"
+            "• Cache timeout too short\n"
+            "• Cache size too small"
+        )
+
+    embed.add_field(name="💡 Analysis", value=interpretation, inline=False)
+
+    embed.set_footer(text=f"Cache timeout: {CACHE_TIMEOUT}s | Cleaning interval: 5min")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="cache-clear", description="Clear the API cache (Developer only)"
+)
+async def cache_clear(interaction: discord.Interaction):
+    """Manually clear API cache - Developer only"""
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ This command is only available to the bot owner.", ephemeral=True
+        )
+        return
+
+    smogon_cog = bot.get_cog("Smogon")
+    if not smogon_cog or not hasattr(smogon_cog, "api_client"):
+        await interaction.response.send_message(
+            "❌ API client not available.", ephemeral=True
+        )
+        return
+
+    # Get stats before clearing
+    api_client = smogon_cog.api_client
+    old_stats = api_client.get_cache_stats()
+
+    # Clear cache
+    api_client.clear_cache()
+
+    embed = discord.Embed(
+        title="✅ Cache Cleared",
+        description="API cache has been manually cleared",
+        color=0x00FF00,
+        timestamp=interaction.created_at,
+    )
+
+    embed.add_field(
+        name="Removed", value=f"{old_stats['size']} cached entries", inline=True
+    )
+
+    embed.add_field(name="Previous Hit Rate", value=old_stats["hit_rate"], inline=True)
+
+    embed.add_field(
+        name="Total Requests",
+        value=f"{old_stats['hits'] + old_stats['misses']:,}",
+        inline=True,
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ========================================
+# RATE LIMITING COMMANDS
+# ========================================
+
+
+@bot.tree.command(
+    name="ratelimit-stats", description="View rate limiter statistics (Developer only)"
+)
+async def ratelimit_stats(interaction: discord.Interaction):
+    """View global rate limiter stats - Developer only"""
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ This command is only available to the bot owner.", ephemeral=True
+        )
+        return
+
+    if not RATE_LIMIT_ENABLED or not global_rate_limiter:
+        await interaction.response.send_message(
+            "❌ Rate limiting is disabled.", ephemeral=True
+        )
+        return
+
+    stats = global_rate_limiter.get_stats()
+
+    embed = discord.Embed(
+        title="🚦 Rate Limiter Statistics",
+        description="Global rate limiting across all commands and channels",
+        color=0xFF6347,
+        timestamp=interaction.created_at,
+    )
+
+    # Configuration
+    embed.add_field(
+        name="⚙️ Configuration",
+        value=(
+            f"**Max Requests:** {stats['max_requests']}\n"
+            f"**Time Window:** {stats['window']}s\n"
+            f"**Scope:** Per User (Global)"
+        ),
+        inline=True,
+    )
+
+    # Current Status
+    limited_emoji = "🔴" if stats["currently_limited"] > 0 else "🟢"
+    embed.add_field(
+        name=f"{limited_emoji} Current Status",
+        value=(
+            f"**Users Tracked:** {stats['total_users_tracked']}\n"
+            f"**Currently Limited:** {stats['currently_limited']}\n"
+            f"**Total Violations:** {stats['total_violations']:,}"
+        ),
+        inline=True,
+    )
+
+    # Performance
+    embed.add_field(
+        name="📊 Performance",
+        value=(
+            f"**Total Requests:** {stats['total_requests']:,}\n"
+            f"**Blocked:** {stats['total_blocked']:,}\n"
+            f"**Block Rate:** {stats['block_rate']}"
+        ),
+        inline=True,
+    )
+
+    # User's personal status
+    user_requests, user_remaining, user_reset = global_rate_limiter.get_user_info(
+        interaction.user.id
+    )
+
+    user_bar = "█" * user_requests + "░" * user_remaining
+    user_status_emoji = (
+        "🟢" if user_remaining > 5 else "🟡" if user_remaining > 0 else "🔴"
+    )
+
+    embed.add_field(
+        name=f"{user_status_emoji} Your Status",
+        value=(
+            f"```{user_bar}```\n"
+            f"**Used:** {user_requests}/{stats['max_requests']}\n"
+            f"**Remaining:** {user_remaining}\n"
+            f"**Resets In:** {user_reset:.1f}s"
+        ),
+        inline=False,
+    )
+
+    # Top violators
+    top_violators = global_rate_limiter.get_top_violators(3)
+    if top_violators:
+        violators_text = []
+        for user_id, count in top_violators:
+            user = bot.get_user(user_id)
+            username = user.name if user else f"Unknown ({user_id})"
+            violators_text.append(f"• {username}: {count:,} violations")
+
+        embed.add_field(
+            name="⚠️ Top Violators", value="\n".join(violators_text), inline=False
+        )
+
+    embed.set_footer(text="Rate limits are per-user across all channels and servers")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="ratelimit-reset", description="Reset rate limit for a user (Developer only)"
+)
+@discord.app_commands.describe(user="User to reset rate limit for")
+async def ratelimit_reset(interaction: discord.Interaction, user: discord.User):
+    """Reset rate limit for a specific user - Developer only"""
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ This command is only available to the bot owner.", ephemeral=True
+        )
+        return
+
+    if not RATE_LIMIT_ENABLED or not global_rate_limiter:
+        await interaction.response.send_message(
+            "❌ Rate limiting is disabled.", ephemeral=True
+        )
+        return
+
+    # Get user info before reset
+    before_requests, before_remaining, _ = global_rate_limiter.get_user_info(user.id)
+
+    # Reset user
+    was_limited = global_rate_limiter.reset_user(user.id)
+
+    if was_limited:
+        embed = discord.Embed(
+            title="✅ Rate Limit Reset",
+            description=f"Rate limit cleared for {user.mention}",
+            color=0x00FF00,
+            timestamp=interaction.created_at,
+        )
+
+        embed.add_field(
+            name="Before Reset",
+            value=(
+                f"Requests: {before_requests}/{global_rate_limiter.max_requests}\n"
+                f"Remaining: {before_remaining}"
+            ),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="After Reset",
+            value=(
+                f"Requests: 0/{global_rate_limiter.max_requests}\n"
+                f"Remaining: {global_rate_limiter.max_requests}"
+            ),
+            inline=True,
+        )
+    else:
+        embed = discord.Embed(
+            title="ℹ️ No Rate Limit",
+            description=f"{user.mention} was not rate limited",
+            color=0x3498DB,
+            timestamp=interaction.created_at,
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ========================================
+# SHINY CHANNEL MANAGEMENT COMMANDS
+# ========================================
+
+
 @bot.tree.command(
     name="shiny-channel",
     description="Manage shiny monitoring channels for this server (Developer only)",
@@ -774,6 +1150,11 @@ async def shiny_archive(
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ========================================
+# GENERAL BOT COMMANDS
+# ========================================
+
+
 @bot.hybrid_command(name="help", description="Show bot commands and usage")
 async def help_command(ctx: commands.Context):
     """Display help information"""
@@ -786,19 +1167,34 @@ async def help_command(ctx: commands.Context):
     embed.add_field(
         name="📖 Command Usage",
         value=(
-            "**Slash Command:**\n"
+            "**Slash Commands:**\n"
             "`/smogon <pokemon> [generation] [tier]`\n"
             "`/effortvalue <pokemon>`\n"
             "`/sprite <pokemon> [shiny] [generation]`\n"
             "`/dmgcalc`\n"
             "`/ping`\n"
             "`/uptime` (Developer only)\n"
+            "`/cache-stats` (Developer only)\n"
+            "`/cache-clear` (Developer only)\n"
+            "`/ratelimit-stats` (Developer only)\n"
+            "`/ratelimit-reset <user>` (Developer only)\n"
             "`/shiny-channel <action>` (Developer only)\n"
             "`/shiny-archive <action>` (Developer only)\n\n"
             "**Note:** Shiny commands are per-server. Each server has its own configuration."
         ),
         inline=False,
     )
+
+    if RATE_LIMIT_ENABLED:
+        embed.add_field(
+            name="🚦 Rate Limits",
+            value=(
+                f"**Max Requests:** {RATE_LIMIT_MAX_REQUESTS} per {RATE_LIMIT_WINDOW}s\n"
+                "**Scope:** Per user, across all channels\n"
+                "**Purpose:** Prevent spam and ensure fair usage"
+            ),
+            inline=False,
+        )
 
     embed.set_footer(text="Data from Smogon University • Powered by pkmn.cc")
 
@@ -916,6 +1312,19 @@ async def uptime(interaction: discord.Interaction):
                 inline=False,
             )
 
+        if RATE_LIMIT_ENABLED and global_rate_limiter:
+            rl_stats = global_rate_limiter.get_stats()
+            embed.add_field(
+                name="🚦 Rate Limiting",
+                value=(
+                    f"Status: **Enabled**\n"
+                    f"Users Tracked: {rl_stats['total_users_tracked']}\n"
+                    f"Currently Limited: {rl_stats['currently_limited']}\n"
+                    f"Block Rate: {rl_stats['block_rate']}"
+                ),
+                inline=False,
+            )
+
         embed.set_footer(text=f"Bot Owner: {interaction.user.name}")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -964,15 +1373,17 @@ async def debug_message(interaction: discord.Interaction):
         for idx, embed in enumerate(last_msg.embeds):
             debug_info.append("")
             debug_info.append(f"**═══ Embed {idx + 1} ═══**")
-            debug_info.append(f"**Title:** `{embed.title}`")
+
+            if embed.title:
+                debug_info.append(f"**Title:** `{embed.title}`")
 
             if embed.author:
                 debug_info.append(f"**Author Name:** `{embed.author.name}`")
                 debug_info.append(f"**Author Icon:** {embed.author.icon_url or 'None'}")
 
             if embed.description:
-                desc_preview = embed.description[:100]
-                debug_info.append(f"**Description:** `{desc_preview}...`")
+                desc_preview = embed.description[:200]
+                debug_info.append(f"**Description:**\n```{desc_preview}```")
 
             if embed.footer:
                 debug_info.append(f"**Footer Text:** `{embed.footer.text}`")
@@ -983,19 +1394,30 @@ async def debug_message(interaction: discord.Interaction):
             debug_info.append("")
             debug_info.append("**🔍 PATTERN TESTS:**")
 
+            # Test description (PRIMARY CHECK)
+            if embed.description:
+                match = SHINY_PATTERN.search(embed.description)
+                debug_info.append(f"**Description match: `{match is not None}`**")
+                if match:
+                    debug_info.append(f"**✅ SHINY FOUND: `{match.group()}`**")
+                else:
+                    debug_info.append("❌ No shiny pattern in description")
+
+            # Test title
             if embed.title:
                 match = SHINY_PATTERN.search(embed.title)
                 debug_info.append(f"Title match: `{match is not None}`")
 
+            # Test author name
             if embed.author and embed.author.name:
                 match = SHINY_PATTERN.search(embed.author.name)
-                debug_info.append(f"**Author.name match: `{match is not None}`**")
-                if match:
-                    debug_info.append(f"**✅ MATCHED IN AUTHOR: `{match.group()}`**")
+                debug_info.append(f"Author.name match: `{match is not None}`")
     else:
         debug_info.append("No embeds!")
 
     full_text = "\n".join(debug_info)
+
+    # Split into chunks if too long
     if len(full_text) > 2000:
         chunks = [full_text[i : i + 2000] for i in range(0, len(full_text), 2000)]
         for chunk in chunks:

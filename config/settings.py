@@ -277,3 +277,9 @@ TYPE_EMOJIS = {
     "fairy": "🧚",
     "stellar": "✨",
 }
+
+# Rate Limiting Configuration
+RATE_LIMIT_ENABLED = True
+RATE_LIMIT_MAX_REQUESTS = 15  # Max requests per user
+RATE_LIMIT_WINDOW = 60  # Time window in seconds (1 minute)
+RATE_LIMIT_CLEANUP_INTERVAL = 300  # Cleanup every 5 minutes

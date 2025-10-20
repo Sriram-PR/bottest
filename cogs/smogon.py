@@ -1,3 +1,8 @@
+# At the very top of smogon.py, add this import:
+import sys
+
+sys.path.append("..")  # Allow importing from parent directory
+
 import logging
 from typing import Dict, Optional
 
@@ -79,6 +84,27 @@ class Smogon(commands.Cog):
             .smogon charizard gen7 uu
             /smogon garchomp gen9 ou
         """
+        # Check global rate limit FIRST (before any processing)
+        if RATE_LIMIT_ENABLED and global_rate_limiter:
+            if not global_rate_limiter.is_allowed(ctx.author.id):
+                time_remaining = global_rate_limiter.get_time_until_reset(ctx.author.id)
+                remaining = global_rate_limiter.get_remaining_requests(ctx.author.id)
+
+                embed = discord.Embed(
+                    title="⏱️ Rate Limit Exceeded",
+                    description=(
+                        f"You're sending commands too quickly!\n\n"
+                        f"**Limit:** {global_rate_limiter.max_requests} requests per "
+                        f"{global_rate_limiter.window} seconds\n"
+                        f"**Remaining:** {remaining}\n"
+                        f"**Try again in:** {time_remaining:.1f}s"
+                    ),
+                    color=0xFF6B6B,
+                )
+                await ctx.send(embed=embed, delete_after=15)
+                return
+
+        # Continue with normal command processing
         await self._process_smogon_command(ctx, pokemon, generation, tier)
 
     @hybrid_defer
