@@ -865,32 +865,42 @@ async def ping(ctx: commands.Context):
     """Check bot's latency"""
     import time
 
-    # Measure API response time
-    start_time = time.perf_counter()
-
     # WebSocket latency
     ws_latency = round(bot.latency * 1000, 2)
 
-    # Send message and measure
     if ctx.interaction:
-        await ctx.defer()
-        msg = await ctx.send("Calculating...")
+        # Slash command - ephemeral
+        start_time = time.perf_counter()
+        await ctx.defer(ephemeral=True)
+        api_latency = round((time.perf_counter() - start_time) * 1000, 2)
+
+        embed = discord.Embed(color=0x2B2D31)
+        embed.add_field(
+            name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
+        )
+        embed.add_field(
+            name="API Response Time", value=f"```{api_latency} ms```", inline=True
+        )
+
+        await ctx.send(embed=embed)
     else:
-        msg = await ctx.send("Calculating...")
+        # Prefix command - normal message
+        start_time = time.perf_counter()
 
-    # Calculate API response time
-    api_latency = round((time.perf_counter() - start_time) * 1000, 2)
+        embed = discord.Embed(color=0x2B2D31)
+        embed.add_field(
+            name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
+        )
+        embed.add_field(name="API Response Time", value="```...```", inline=True)
 
-    # Update with results
-    embed = discord.Embed(color=0x2B2D31)  # Discord dark theme color
-    embed.add_field(
-        name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
-    )
-    embed.add_field(
-        name="API Response Time", value=f"```{api_latency} ms```", inline=True
-    )
+        msg = await ctx.send(embed=embed)
+        api_latency = round((time.perf_counter() - start_time) * 1000, 2)
 
-    await msg.edit(content=None, embed=embed)
+        # Update with actual API latency
+        embed.set_field_at(
+            1, name="API Response Time", value=f"```{api_latency} ms```", inline=True
+        )
+        await msg.edit(embed=embed)
 
 
 @bot.tree.command(name="uptime", description="Check bot uptime (Developer only)")
