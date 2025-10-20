@@ -811,13 +811,44 @@ async def help_command(ctx: commands.Context):
 @bot.hybrid_command(name="ping", description="Check bot latency and response time")
 async def ping(ctx: commands.Context):
     """Check bot's latency"""
-    latency = round(bot.latency * 1000)
-    message = f"🏓 Pong! **{latency}ms**"
+    import time
+
+    # WebSocket latency
+    ws_latency = round(bot.latency * 1000, 2)
 
     if ctx.interaction:
-        await ctx.send(message, ephemeral=True)
+        # Slash command - ephemeral
+        start_time = time.perf_counter()
+        await ctx.defer(ephemeral=True)
+        api_latency = round((time.perf_counter() - start_time) * 1000, 2)
+
+        embed = discord.Embed(color=0x2B2D31)
+        embed.add_field(
+            name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
+        )
+        embed.add_field(
+            name="API Response Time", value=f"```{api_latency} ms```", inline=True
+        )
+
+        await ctx.send(embed=embed)
     else:
-        await ctx.send(message)
+        # Prefix command - normal message
+        start_time = time.perf_counter()
+
+        embed = discord.Embed(color=0x2B2D31)
+        embed.add_field(
+            name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
+        )
+        embed.add_field(name="API Response Time", value="```...```", inline=True)
+
+        msg = await ctx.send(embed=embed)
+        api_latency = round((time.perf_counter() - start_time) * 1000, 2)
+
+        # Update with actual API latency
+        embed.set_field_at(
+            1, name="API Response Time", value=f"```{api_latency} ms```", inline=True
+        )
+        await msg.edit(embed=embed)
 
 
 @bot.tree.command(name="uptime", description="Check bot uptime (Developer only)")
