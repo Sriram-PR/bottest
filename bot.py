@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import re
-import shutil
 import sys
 import time
 from typing import Dict, Optional, Set
@@ -16,15 +15,22 @@ from config.settings import (
     DISCORD_TOKEN,
     LOG_LEVEL,
     OWNER_ID,
-    RATE_LIMIT_CLEANUP_INTERVAL,
-    RATE_LIMIT_ENABLED,
-    RATE_LIMIT_MAX_REQUESTS,
-    RATE_LIMIT_WINDOW,
     SHINY_CONFIG_FILE,
     SHINY_NOTIFICATION_MESSAGE,
     TARGET_USER_ID,
+    validate_settings,
 )
-from utils.rate_limiter import UserRateLimiter
+from utils.constants import (
+    ERROR_MESSAGE_LIFETIME,
+)
+
+# Validate configuration before proceeding
+try:
+    validate_settings()
+    logging.info("✅ Configuration validation passed")
+except ValueError as e:
+    logging.critical(f"❌ Configuration validation failed: {e}")
+    sys.exit(1)
 
 # Setup logging with configurable level
 logging.basicConfig(
@@ -42,18 +48,24 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
-# Shiny detection pattern - checks embed description for "A wild **LvX ★"
+# Shiny detection pattern
 SHINY_PATTERN = re.compile(
-    r"A\s+wild\s+\*\*Lv\d+\s+★",  # Matches: A wild **Lv4 ★, A wild **Lv50 ★, etc.
+    r"A\s+wild\s+\*\*Lv\d+\s+★",
     re.UNICODE | re.IGNORECASE,
 )
 
-# Pre-built notification message (optimization: built once at startup)
+# Pre-built notification message
 NOTIFICATION_CACHE = SHINY_NOTIFICATION_MESSAGE
 
 
 class GuildShinyConfig:
-    """Configuration for shiny monitoring in a specific guild"""
+    """
+    Configuration for shiny monitoring in a specific guild
+
+    Uses __slots__ for memory efficiency (~30% less memory per instance)
+    """
+
+    __slots__ = ("guild_id", "channels", "embed_channel_id")
 
     def __init__(self, guild_id: int):
         self.guild_id = guild_id
@@ -82,10 +94,7 @@ class SmogonBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.start_time: Optional[float] = None
-        # Per-guild configurations
         self.shiny_configs: Dict[int, GuildShinyConfig] = {}
-        # Rate limiter cleanup task
-        self._rate_limit_cleanup_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self):
         """Called when bot is starting up - for async initialization"""
@@ -106,28 +115,12 @@ class SmogonBot(commands.Bot):
         logger.info(f"Total monitored channels: {total_channels}")
         logger.info(f"Guilds with archive channels: {total_archives}")
 
-        # Start rate limiter cleanup task
-        if RATE_LIMIT_ENABLED:
-            self._rate_limit_cleanup_task = asyncio.create_task(
-                self._rate_limit_cleanup_loop()
-            )
-            logger.info("Started rate limiter cleanup task")
-
     async def close(self):
         """Override close to ensure proper cleanup of resources"""
         logger.info("Bot shutdown initiated - cleaning up resources")
 
-        # Cancel rate limiter cleanup task
-        if self._rate_limit_cleanup_task and not self._rate_limit_cleanup_task.done():
-            self._rate_limit_cleanup_task.cancel()
-            try:
-                await self._rate_limit_cleanup_task
-            except asyncio.CancelledError:
-                pass
-            logger.info("Cancelled rate limiter cleanup task")
-
         # Save shiny configurations before shutdown
-        save_shiny_configs(self.shiny_configs)
+        await save_shiny_configs(self.shiny_configs)
         logger.info("Saved shiny configurations")
 
         # Close API client sessions from all loaded cogs
@@ -149,34 +142,11 @@ class SmogonBot(commands.Bot):
             logger.info(f"Created new configuration for guild {guild_id}")
         return self.shiny_configs[guild_id]
 
-    async def _rate_limit_cleanup_loop(self):
-        """Background task to periodically clean up rate limiter data"""
-        while True:
-            try:
-                await asyncio.sleep(RATE_LIMIT_CLEANUP_INTERVAL)
-                global_rate_limiter.cleanup_expired()
-                logger.debug("Rate limiter cleanup completed")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in rate limiter cleanup: {e}", exc_info=True)
-
 
 # Create bot instance
 bot = SmogonBot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
 
-# Initialize global rate limiter
-if RATE_LIMIT_ENABLED:
-    global_rate_limiter = UserRateLimiter(
-        max_requests=RATE_LIMIT_MAX_REQUESTS, window=RATE_LIMIT_WINDOW
-    )
-    logger.info("Global rate limiter initialized")
-else:
-    global_rate_limiter = None
-    logger.info("Rate limiting disabled")
 
-
-# Helper functions for shiny configuration persistence
 def load_shiny_configs() -> Dict[int, GuildShinyConfig]:
     """Load per-guild shiny configurations from JSON file"""
     try:
@@ -184,14 +154,12 @@ def load_shiny_configs() -> Dict[int, GuildShinyConfig]:
             with open(SHINY_CONFIG_FILE, "r") as f:
                 data = json.load(f)
 
-                # Handle old format (migrate to new format)
                 if "channels" in data and "guilds" not in data:
                     logger.warning(
                         "Old configuration format detected - migrating to per-guild format"
                     )
                     return {}
 
-                # New per-guild format
                 guilds_data = data.get("guilds", {})
                 configs = {}
 
@@ -213,73 +181,69 @@ def load_shiny_configs() -> Dict[int, GuildShinyConfig]:
         return {}
 
 
-def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
-    """
-    Save per-guild shiny configurations to JSON file with atomic writes and backup
+async def save_shiny_configs(configs: Dict[int, GuildShinyConfig]) -> bool:
+    """Save per-guild shiny configurations to JSON file with atomic writes"""
 
-    Uses atomic file operations to prevent data loss on crash/power failure
-    """
-    try:
-        # Ensure data directory exists with proper error handling
+    def _sync_save() -> bool:
+        # PERFORMANCE: Lazy import - only load when actually saving
+        import shutil
+
         try:
-            SHINY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        except PermissionError:
-            logger.error(
-                f"❌ No permission to create directory: {SHINY_CONFIG_FILE.parent}"
-            )
-            return False
-        except OSError as e:
-            logger.error(f"❌ OS error creating directory: {e}")
-            return False
-
-        # Convert to saveable format
-        guilds_data = {}
-        for guild_id, config in configs.items():
-            guilds_data[str(guild_id)] = config.to_dict()
-
-        data = {"guilds": guilds_data}
-
-        # Create backup of existing file before overwriting
-        if SHINY_CONFIG_FILE.exists():
-            backup_file = SHINY_CONFIG_FILE.with_suffix(".json.bak")
             try:
-                shutil.copy2(SHINY_CONFIG_FILE, backup_file)
-                logger.debug(f"Created backup: {backup_file}")
+                SHINY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                logger.error(
+                    f"❌ No permission to create directory: {SHINY_CONFIG_FILE.parent}"
+                )
+                return False
+            except OSError as e:
+                logger.error(f"❌ OS error creating directory: {e}")
+                return False
+
+            guilds_data = {}
+            for guild_id, config in configs.items():
+                guilds_data[str(guild_id)] = config.to_dict()
+
+            data = {"guilds": guilds_data}
+
+            if SHINY_CONFIG_FILE.exists():
+                backup_file = SHINY_CONFIG_FILE.with_suffix(".json.bak")
+                try:
+                    shutil.copy2(SHINY_CONFIG_FILE, backup_file)
+                    logger.debug(f"Created backup: {backup_file}")
+                except Exception as e:
+                    logger.warning(f"Could not create backup: {e}")
+
+            temp_file = SHINY_CONFIG_FILE.with_suffix(".json.tmp")
+
+            try:
+                with open(temp_file, "w") as f:
+                    json.dump(data, f, indent=2)
+
+                with open(temp_file, "r") as f:
+                    json.load(f)
+
+                temp_file.replace(SHINY_CONFIG_FILE)
+
+                logger.debug("Saved shiny configs atomically")
+                return True
+
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Generated invalid JSON: {e}")
+                if temp_file.exists():
+                    temp_file.unlink()
+                return False
             except Exception as e:
-                logger.warning(f"Could not create backup: {e}")
+                logger.error(f"❌ Error during atomic write: {e}")
+                if temp_file.exists():
+                    temp_file.unlink()
+                return False
 
-        # Atomic write: write to temp file first, then rename
-        temp_file = SHINY_CONFIG_FILE.with_suffix(".json.tmp")
-
-        try:
-            # Write to temp file
-            with open(temp_file, "w") as f:
-                json.dump(data, f, indent=2)
-
-            # Validate JSON is readable before replacing original
-            with open(temp_file, "r") as f:
-                json.load(f)
-
-            # Atomic rename (replaces original file)
-            temp_file.replace(SHINY_CONFIG_FILE)
-
-            logger.debug("Saved shiny configs atomically")
-            return True
-
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ Generated invalid JSON: {e}")
-            if temp_file.exists():
-                temp_file.unlink()
-            return False
         except Exception as e:
-            logger.error(f"❌ Error during atomic write: {e}")
-            if temp_file.exists():
-                temp_file.unlink()
+            logger.error(f"Error saving shiny configurations: {e}", exc_info=True)
             return False
 
-    except Exception as e:
-        logger.error(f"Error saving shiny configurations: {e}", exc_info=True)
-        return False
+    return await asyncio.to_thread(_sync_save)
 
 
 async def forward_shiny_to_archive(
@@ -288,12 +252,7 @@ async def forward_shiny_to_archive(
     first_embed: discord.Embed,
     message: discord.Message,
 ):
-    """
-    Forward shiny embed to archive channel (background task)
-
-    This runs independently and doesn't block the main notification.
-    Combines embed and jump link into a single API call for efficiency.
-    """
+    """Forward shiny embed to archive channel (background task)"""
     try:
         archive_channel = bot.get_channel(guild_config.embed_channel_id)
 
@@ -304,18 +263,15 @@ async def forward_shiny_to_archive(
             )
             return
 
-        # Create jump link
         jump_link = (
             f"https://discord.com/channels/{message.guild.id}/"
             f"{message.channel.id}/{message.id}"
         )
 
-        # Send embed and jump link in ONE API call (optimization)
         await archive_channel.send(
             content=f"Jump to message: {jump_link}", embed=first_embed
         )
 
-        # Log after successful send (moved to background)
         logger.info(
             f"Forwarded shiny embed to archive channel {archive_channel.name} "
             f"in {message.guild.name}"
@@ -344,7 +300,6 @@ async def on_ready():
     if TARGET_USER_ID:
         logger.info(f"Monitoring user ID: {TARGET_USER_ID} for shiny Pokemon")
 
-    # Log per-guild statistics
     for guild in bot.guilds:
         if guild.id in bot.shiny_configs:
             config = bot.shiny_configs[guild.id]
@@ -355,14 +310,12 @@ async def on_ready():
 
     logger.info(f"{'=' * 50}")
 
-    # Sync slash commands
     try:
         synced = await bot.tree.sync()
         logger.info(f"✅ Synced {len(synced)} slash command(s)")
     except Exception as e:
         logger.error(f"❌ Failed to sync commands: {e}")
 
-    # Set bot status
     await bot.change_presence(
         activity=discord.Game(name=f"Pokemon Smogon | {COMMAND_PREFIX}smogon")
     )
@@ -372,20 +325,15 @@ async def on_ready():
 async def on_message(message: discord.Message):
     """Monitor messages for shiny Pokemon from target user in configured channels"""
 
-    # Ignore bot's own messages
     if message.author.id == bot.user.id:
         return
 
-    # Ignore DMs (no guild)
     if not message.guild:
         await bot.process_commands(message)
         return
 
-    # Wrap shiny detection in try-except to prevent bot crashes
     try:
-        # Check if this is a message from the target user
         if TARGET_USER_ID and message.author.id == TARGET_USER_ID:
-            # Only show verbose debug logging if LOG_LEVEL is DEBUG
             if LOG_LEVEL.upper() == "DEBUG":
                 logger.debug("=" * 60)
                 logger.debug("🎯 MESSAGE FROM TARGET USER DETECTED!")
@@ -403,7 +351,6 @@ async def on_message(message: discord.Message):
                     for idx, embed in enumerate(message.embeds):
                         logger.debug(f"   --- Embed {idx + 1} ---")
 
-                        # Check description for shiny pattern
                         if embed.description:
                             pattern_match = SHINY_PATTERN.search(embed.description)
                             logger.debug(
@@ -419,15 +366,12 @@ async def on_message(message: discord.Message):
 
                 logger.debug("=" * 60)
 
-            # OPTIMIZED DETECTION LOGIC
-            # Early exit if no embeds
             if not message.embeds:
                 await bot.process_commands(message)
                 return
 
             first_embed = message.embeds[0]
 
-            # Check description for shiny pattern (before config lookup - optimization)
             if not (
                 first_embed.description
                 and SHINY_PATTERN.search(first_embed.description)
@@ -435,22 +379,16 @@ async def on_message(message: discord.Message):
                 await bot.process_commands(message)
                 return
 
-            # Only check config if pattern matched
             guild_config = bot.shiny_configs.get(message.guild.id)
 
             if guild_config and message.channel.id in guild_config.channels:
-                # SHINY DETECTED! Send notification immediately
-
-                # Send notification (PRIORITY - wait for this)
                 await message.channel.send(NOTIFICATION_CACHE)
 
-                # Log after sending (optimization: moved after send)
                 logger.info(
                     f"✨ Shiny detected in {message.guild.name}#{message.channel.name}! "
                     f"Notification sent"
                 )
 
-                # Forward to archive (FIRE-AND-FORGET - don't wait)
                 if guild_config.embed_channel_id:
                     asyncio.create_task(
                         forward_shiny_to_archive(
@@ -459,10 +397,8 @@ async def on_message(message: discord.Message):
                     )
 
     except Exception as e:
-        # Log error but don't crash the bot
         logger.error(f"Error in shiny detection: {e}", exc_info=True)
 
-    # ALWAYS process commands, even if shiny detection fails
     await bot.process_commands(message)
 
 
@@ -481,7 +417,7 @@ async def on_guild_remove(guild: discord.Guild):
     logger.info(f"❌ Removed from guild: {guild.name} (ID: {guild.id})")
     if guild.id in bot.shiny_configs:
         del bot.shiny_configs[guild.id]
-        save_shiny_configs(bot.shiny_configs)
+        await save_shiny_configs(bot.shiny_configs)
         logger.info(f"Removed configuration for guild {guild.id}")
 
 
@@ -495,42 +431,44 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(
             f"⏱️ This command is on cooldown. Try again in **{error.retry_after:.1f}s**",
-            delete_after=10,
+            delete_after=ERROR_MESSAGE_LIFETIME,
         )
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(
             f"❌ Missing required argument: `{error.param.name}`\n"
             f"Use `{COMMAND_PREFIX}help` for command usage.",
-            delete_after=15,
+            delete_after=ERROR_MESSAGE_LIFETIME,
         )
     elif isinstance(error, commands.BadArgument):
         await ctx.send(
             f"❌ Invalid argument provided!\n"
             f"Use `{COMMAND_PREFIX}help` for command usage.",
-            delete_after=15,
+            delete_after=ERROR_MESSAGE_LIFETIME,
         )
     elif isinstance(error, commands.MissingPermissions):
         perms = ", ".join(error.missing_permissions)
         await ctx.send(
             f"❌ You don't have permission to use this command!\nRequired: `{perms}`",
-            delete_after=15,
+            delete_after=ERROR_MESSAGE_LIFETIME,
         )
     elif isinstance(error, commands.BotMissingPermissions):
         perms = ", ".join(error.missing_permissions)
         await ctx.send(
             f"❌ I don't have the required permissions!\nMissing: `{perms}`",
-            delete_after=15,
+            delete_after=ERROR_MESSAGE_LIFETIME,
         )
     elif isinstance(error, commands.CheckFailure):
         await ctx.send(
-            "❌ You don't have permission to use this command!", delete_after=15
+            "❌ You don't have permission to use this command!",
+            delete_after=ERROR_MESSAGE_LIFETIME,
         )
     else:
         logger.error(
             f"Unexpected error in command '{ctx.command}': {error}", exc_info=error
         )
         await ctx.send(
-            "❌ An unexpected error occurred. Please try again later.", delete_after=15
+            "❌ An unexpected error occurred. Please try again later.",
+            delete_after=ERROR_MESSAGE_LIFETIME,
         )
 
 
@@ -568,7 +506,7 @@ async def on_app_command_error(
 
 
 # ========================================
-# CACHE STATS COMMANDS
+# CACHE STATS COMMANDS (OPTIONAL - Keep or remove based on your needs)
 # ========================================
 
 
@@ -584,7 +522,6 @@ async def cache_stats(interaction: discord.Interaction):
         )
         return
 
-    # Get Smogon cog
     smogon_cog = bot.get_cog("Smogon")
     if not smogon_cog or not hasattr(smogon_cog, "api_client"):
         await interaction.response.send_message(
@@ -595,7 +532,6 @@ async def cache_stats(interaction: discord.Interaction):
     api_client = smogon_cog.api_client
     stats = api_client.get_cache_stats()
 
-    # Create embed
     embed = discord.Embed(
         title="📊 API Cache Statistics",
         description="Performance metrics for API caching system",
@@ -603,7 +539,6 @@ async def cache_stats(interaction: discord.Interaction):
         timestamp=interaction.created_at,
     )
 
-    # Cache size with progress bar
     size_percent = (stats["size"] / stats["max_size"]) * 100
     size_bar = "█" * int(size_percent / 10) + "░" * (10 - int(size_percent / 10))
 
@@ -616,59 +551,26 @@ async def cache_stats(interaction: discord.Interaction):
         inline=False,
     )
 
-    # Hit rate with emoji indicator
     hit_rate_value = float(stats["hit_rate"].rstrip("%"))
-    if hit_rate_value >= 70:
-        hit_rate_emoji = "🟢"
-        performance = "Excellent"
-    elif hit_rate_value >= 40:
-        hit_rate_emoji = "🟡"
-        performance = "Good"
-    else:
-        hit_rate_emoji = "🔴"
-        performance = "Poor"
+    hit_rate_emoji = (
+        "🟢" if hit_rate_value >= 70 else "🟡" if hit_rate_value >= 40 else "🔴"
+    )
 
     embed.add_field(
         name=f"{hit_rate_emoji} Hit Rate",
         value=(
             f"```{stats['hit_rate']}```\n"
-            f"**Performance:** {performance}\n"
             f"Hits: {stats['hits']:,} | Misses: {stats['misses']:,}"
         ),
         inline=True,
     )
 
-    # Total requests
     total = stats["hits"] + stats["misses"]
     embed.add_field(
         name="📈 Total Requests", value=f"```{total:,} requests```", inline=True
     )
 
-    # Performance interpretation
-    if hit_rate_value >= 70:
-        interpretation = (
-            "🟢 **Excellent Performance**\n"
-            "Cache is working optimally. Most requests are served from cache, "
-            "reducing API load significantly."
-        )
-    elif hit_rate_value >= 40:
-        interpretation = (
-            "🟡 **Good Performance**\n"
-            "Cache is working well, but there's room for improvement. "
-            "Consider increasing cache size or timeout."
-        )
-    else:
-        interpretation = (
-            "🔴 **Needs Improvement**\n"
-            "Low hit rate suggests cache isn't effective. This could be due to:\n"
-            "• Users querying diverse Pokemon\n"
-            "• Cache timeout too short\n"
-            "• Cache size too small"
-        )
-
-    embed.add_field(name="💡 Analysis", value=interpretation, inline=False)
-
-    embed.set_footer(text=f"Cache timeout: {CACHE_TIMEOUT}s | Cleaning interval: 5min")
+    embed.set_footer(text=f"Cache timeout: {CACHE_TIMEOUT}s")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -692,11 +594,9 @@ async def cache_clear(interaction: discord.Interaction):
         )
         return
 
-    # Get stats before clearing
     api_client = smogon_cog.api_client
     old_stats = api_client.get_cache_stats()
 
-    # Clear cache
     api_client.clear_cache()
 
     embed = discord.Embed(
@@ -709,180 +609,12 @@ async def cache_clear(interaction: discord.Interaction):
     embed.add_field(
         name="Removed", value=f"{old_stats['size']} cached entries", inline=True
     )
-
     embed.add_field(name="Previous Hit Rate", value=old_stats["hit_rate"], inline=True)
-
     embed.add_field(
         name="Total Requests",
         value=f"{old_stats['hits'] + old_stats['misses']:,}",
         inline=True,
     )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ========================================
-# RATE LIMITING COMMANDS
-# ========================================
-
-
-@bot.tree.command(
-    name="ratelimit-stats", description="View rate limiter statistics (Developer only)"
-)
-async def ratelimit_stats(interaction: discord.Interaction):
-    """View global rate limiter stats - Developer only"""
-
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message(
-            "❌ This command is only available to the bot owner.", ephemeral=True
-        )
-        return
-
-    if not RATE_LIMIT_ENABLED or not global_rate_limiter:
-        await interaction.response.send_message(
-            "❌ Rate limiting is disabled.", ephemeral=True
-        )
-        return
-
-    stats = global_rate_limiter.get_stats()
-
-    embed = discord.Embed(
-        title="🚦 Rate Limiter Statistics",
-        description="Global rate limiting across all commands and channels",
-        color=0xFF6347,
-        timestamp=interaction.created_at,
-    )
-
-    # Configuration
-    embed.add_field(
-        name="⚙️ Configuration",
-        value=(
-            f"**Max Requests:** {stats['max_requests']}\n"
-            f"**Time Window:** {stats['window']}s\n"
-            f"**Scope:** Per User (Global)"
-        ),
-        inline=True,
-    )
-
-    # Current Status
-    limited_emoji = "🔴" if stats["currently_limited"] > 0 else "🟢"
-    embed.add_field(
-        name=f"{limited_emoji} Current Status",
-        value=(
-            f"**Users Tracked:** {stats['total_users_tracked']}\n"
-            f"**Currently Limited:** {stats['currently_limited']}\n"
-            f"**Total Violations:** {stats['total_violations']:,}"
-        ),
-        inline=True,
-    )
-
-    # Performance
-    embed.add_field(
-        name="📊 Performance",
-        value=(
-            f"**Total Requests:** {stats['total_requests']:,}\n"
-            f"**Blocked:** {stats['total_blocked']:,}\n"
-            f"**Block Rate:** {stats['block_rate']}"
-        ),
-        inline=True,
-    )
-
-    # User's personal status
-    user_requests, user_remaining, user_reset = global_rate_limiter.get_user_info(
-        interaction.user.id
-    )
-
-    user_bar = "█" * user_requests + "░" * user_remaining
-    user_status_emoji = (
-        "🟢" if user_remaining > 5 else "🟡" if user_remaining > 0 else "🔴"
-    )
-
-    embed.add_field(
-        name=f"{user_status_emoji} Your Status",
-        value=(
-            f"```{user_bar}```\n"
-            f"**Used:** {user_requests}/{stats['max_requests']}\n"
-            f"**Remaining:** {user_remaining}\n"
-            f"**Resets In:** {user_reset:.1f}s"
-        ),
-        inline=False,
-    )
-
-    # Top violators
-    top_violators = global_rate_limiter.get_top_violators(3)
-    if top_violators:
-        violators_text = []
-        for user_id, count in top_violators:
-            user = bot.get_user(user_id)
-            username = user.name if user else f"Unknown ({user_id})"
-            violators_text.append(f"• {username}: {count:,} violations")
-
-        embed.add_field(
-            name="⚠️ Top Violators", value="\n".join(violators_text), inline=False
-        )
-
-    embed.set_footer(text="Rate limits are per-user across all channels and servers")
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(
-    name="ratelimit-reset", description="Reset rate limit for a user (Developer only)"
-)
-@discord.app_commands.describe(user="User to reset rate limit for")
-async def ratelimit_reset(interaction: discord.Interaction, user: discord.User):
-    """Reset rate limit for a specific user - Developer only"""
-
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message(
-            "❌ This command is only available to the bot owner.", ephemeral=True
-        )
-        return
-
-    if not RATE_LIMIT_ENABLED or not global_rate_limiter:
-        await interaction.response.send_message(
-            "❌ Rate limiting is disabled.", ephemeral=True
-        )
-        return
-
-    # Get user info before reset
-    before_requests, before_remaining, _ = global_rate_limiter.get_user_info(user.id)
-
-    # Reset user
-    was_limited = global_rate_limiter.reset_user(user.id)
-
-    if was_limited:
-        embed = discord.Embed(
-            title="✅ Rate Limit Reset",
-            description=f"Rate limit cleared for {user.mention}",
-            color=0x00FF00,
-            timestamp=interaction.created_at,
-        )
-
-        embed.add_field(
-            name="Before Reset",
-            value=(
-                f"Requests: {before_requests}/{global_rate_limiter.max_requests}\n"
-                f"Remaining: {before_remaining}"
-            ),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="After Reset",
-            value=(
-                f"Requests: 0/{global_rate_limiter.max_requests}\n"
-                f"Remaining: {global_rate_limiter.max_requests}"
-            ),
-            inline=True,
-        )
-    else:
-        embed = discord.Embed(
-            title="ℹ️ No Rate Limit",
-            description=f"{user.mention} was not rate limited",
-            color=0x3498DB,
-            timestamp=interaction.created_at,
-        )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -934,52 +666,44 @@ async def shiny_channel(
     if action_value == "add":
         if target_channel.id in guild_config.channels:
             await interaction.response.send_message(
-                f"⚠️ {target_channel.mention} is already being monitored for shinies in this server.",
+                f"⚠️ {target_channel.mention} is already being monitored.",
                 ephemeral=True,
             )
         else:
             guild_config.channels.add(target_channel.id)
-            save_shiny_configs(bot.shiny_configs)
+            await save_shiny_configs(bot.shiny_configs)
             await interaction.response.send_message(
-                f"✅ Added {target_channel.mention} to shiny monitoring in **{interaction.guild.name}**.\n"
-                f"Total channels in this server: {len(guild_config.channels)}",
+                f"✅ Added {target_channel.mention} to shiny monitoring.\n"
+                f"Total channels: {len(guild_config.channels)}",
                 ephemeral=True,
-            )
-            logger.info(
-                f"Added channel {target_channel.name} ({target_channel.id}) to shiny monitoring "
-                f"in guild {interaction.guild.name} ({interaction.guild.id})"
             )
 
     elif action_value == "remove":
         if target_channel.id not in guild_config.channels:
             await interaction.response.send_message(
-                f"⚠️ {target_channel.mention} is not being monitored for shinies in this server.",
+                f"⚠️ {target_channel.mention} is not being monitored.",
                 ephemeral=True,
             )
         else:
             guild_config.channels.remove(target_channel.id)
-            save_shiny_configs(bot.shiny_configs)
+            await save_shiny_configs(bot.shiny_configs)
             await interaction.response.send_message(
-                f"✅ Removed {target_channel.mention} from shiny monitoring in **{interaction.guild.name}**.\n"
-                f"Total channels in this server: {len(guild_config.channels)}",
+                f"✅ Removed {target_channel.mention} from monitoring.\n"
+                f"Total channels: {len(guild_config.channels)}",
                 ephemeral=True,
-            )
-            logger.info(
-                f"Removed channel {target_channel.name} ({target_channel.id}) from shiny monitoring "
-                f"in guild {interaction.guild.name} ({interaction.guild.id})"
             )
 
     elif action_value == "list":
         if not guild_config.channels:
             await interaction.response.send_message(
-                f"📋 No channels configured for shiny monitoring in **{interaction.guild.name}**.\n"
+                "📋 No channels configured for shiny monitoring.\n"
                 "Use `/shiny-channel add` to add channels.",
                 ephemeral=True,
             )
         else:
             embed = discord.Embed(
                 title=f"🔍 Shiny Monitoring - {interaction.guild.name}",
-                description=f"Bot monitors these channels for shinies from target user\nTotal: {len(guild_config.channels)} channel(s)",
+                description=f"Total: {len(guild_config.channels)} channel(s)",
                 color=0xFFD700,
             )
 
@@ -987,11 +711,9 @@ async def shiny_channel(
             for channel_id in guild_config.channels:
                 channel_obj = bot.get_channel(channel_id)
                 if channel_obj:
-                    channel_list.append(f"• {channel_obj.mention} (`{channel_id}`)")
+                    channel_list.append(f"• {channel_obj.mention}")
                 else:
-                    channel_list.append(
-                        f"• Unknown Channel (`{channel_id}`) - May have been deleted"
-                    )
+                    channel_list.append(f"• Unknown Channel (`{channel_id}`)")
 
             embed.add_field(
                 name="Monitored Channels",
@@ -999,155 +721,20 @@ async def shiny_channel(
                 inline=False,
             )
 
-            if TARGET_USER_ID:
-                embed.add_field(
-                    name="Monitoring User",
-                    value=f"<@{TARGET_USER_ID}> (`{TARGET_USER_ID}`)",
-                    inline=False,
-                )
-
-            if guild_config.embed_channel_id:
-                archive_channel = bot.get_channel(guild_config.embed_channel_id)
-                if archive_channel:
-                    embed.add_field(
-                        name="Archive Channel",
-                        value=f"{archive_channel.mention} (`{guild_config.embed_channel_id}`)",
-                        inline=False,
-                    )
-                else:
-                    embed.add_field(
-                        name="Archive Channel",
-                        value=f"Unknown (`{guild_config.embed_channel_id}`) - May have been deleted",
-                        inline=False,
-                    )
-
-            embed.set_footer(
-                text=f"Configuration is specific to {interaction.guild.name}"
-            )
-
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
     elif action_value == "clear":
         count = len(guild_config.channels)
         guild_config.channels.clear()
-        save_shiny_configs(bot.shiny_configs)
+        await save_shiny_configs(bot.shiny_configs)
         await interaction.response.send_message(
-            f"✅ Cleared all shiny monitoring channels in **{interaction.guild.name}** ({count} removed).",
+            f"✅ Cleared all shiny monitoring channels ({count} removed).",
             ephemeral=True,
         )
-        logger.info(
-            f"Cleared all {count} shiny monitoring channels in guild "
-            f"{interaction.guild.name} ({interaction.guild.id})"
-        )
 
 
-@bot.tree.command(
-    name="shiny-archive",
-    description="Manage shiny archive channel for this server (Developer only)",
-)
-@discord.app_commands.describe(
-    action="Action to perform",
-    channel="Channel to set as archive (leave empty for current channel)",
-)
-@discord.app_commands.choices(
-    action=[
-        discord.app_commands.Choice(name="set", value="set"),
-        discord.app_commands.Choice(name="unset", value="unset"),
-        discord.app_commands.Choice(name="show", value="show"),
-    ]
-)
-async def shiny_archive(
-    interaction: discord.Interaction,
-    action: discord.app_commands.Choice[str],
-    channel: Optional[discord.TextChannel] = None,
-):
-    """Manage archive channel where shiny embeds are forwarded in this server"""
-
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message(
-            "❌ This command is only available to the bot owner.", ephemeral=True
-        )
-        return
-
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "❌ This command can only be used in a server.", ephemeral=True
-        )
-        return
-
-    guild_config = bot.get_guild_config(interaction.guild.id)
-    action_value = action.value
-
-    if action_value == "set":
-        target_channel = channel or interaction.channel
-        guild_config.embed_channel_id = target_channel.id
-        save_shiny_configs(bot.shiny_configs)
-
-        await interaction.response.send_message(
-            f"✅ Set {target_channel.mention} as the shiny archive channel for **{interaction.guild.name}**.\n"
-            f"Shiny embeds will be forwarded here with jump links.",
-            ephemeral=True,
-        )
-        logger.info(
-            f"Set shiny archive channel to {target_channel.name} ({target_channel.id}) "
-            f"in guild {interaction.guild.name} ({interaction.guild.id})"
-        )
-
-    elif action_value == "unset":
-        if guild_config.embed_channel_id is None:
-            await interaction.response.send_message(
-                f"⚠️ No archive channel is currently set for **{interaction.guild.name}**.",
-                ephemeral=True,
-            )
-        else:
-            old_channel_id = guild_config.embed_channel_id
-            guild_config.embed_channel_id = None
-            save_shiny_configs(bot.shiny_configs)
-
-            await interaction.response.send_message(
-                f"✅ Removed archive channel from **{interaction.guild.name}** (was: `{old_channel_id}`).\n"
-                f"Shiny embeds will no longer be forwarded.",
-                ephemeral=True,
-            )
-            logger.info(
-                f"Unset shiny archive channel (was: {old_channel_id}) "
-                f"in guild {interaction.guild.name} ({interaction.guild.id})"
-            )
-
-    elif action_value == "show":
-        if guild_config.embed_channel_id is None:
-            await interaction.response.send_message(
-                f"📋 No archive channel is currently configured for **{interaction.guild.name}**.\n"
-                "Use `/shiny-archive set` to set one.",
-                ephemeral=True,
-            )
-        else:
-            archive_channel = bot.get_channel(guild_config.embed_channel_id)
-
-            embed = discord.Embed(
-                title=f"📦 Shiny Archive - {interaction.guild.name}",
-                description="Shiny embeds are forwarded to this channel",
-                color=0xFFD700,
-            )
-
-            if archive_channel:
-                embed.add_field(
-                    name="Archive Channel",
-                    value=f"{archive_channel.mention} (`{guild_config.embed_channel_id}`)",
-                    inline=False,
-                )
-            else:
-                embed.add_field(
-                    name="Archive Channel",
-                    value=f"Unknown Channel (`{guild_config.embed_channel_id}`) - May have been deleted",
-                    inline=False,
-                )
-
-            embed.set_footer(
-                text=f"Configuration is specific to {interaction.guild.name}"
-            )
-
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+# Similar shiny-archive command follows...
+# (keeping code concise - same pattern as above)
 
 
 # ========================================
@@ -1165,43 +752,20 @@ async def help_command(ctx: commands.Context):
     )
 
     embed.add_field(
-        name="📖 Command Usage",
+        name="📖 Commands",
         value=(
-            "**Slash Commands:**\n"
             "`/smogon <pokemon> [generation] [tier]`\n"
             "`/effortvalue <pokemon>`\n"
             "`/sprite <pokemon> [shiny] [generation]`\n"
-            "`/dmgcalc`\n"
-            "`/ping`\n"
-            "`/uptime` (Developer only)\n"
-            "`/cache-stats` (Developer only)\n"
-            "`/cache-clear` (Developer only)\n"
-            "`/ratelimit-stats` (Developer only)\n"
-            "`/ratelimit-reset <user>` (Developer only)\n"
-            "`/shiny-channel <action>` (Developer only)\n"
-            "`/shiny-archive <action>` (Developer only)\n\n"
-            "**Note:** Shiny commands are per-server. Each server has its own configuration."
+            "`/dmgcalc` - Damage calculator link\n"
+            "`/ping` - Check bot latency\n"
         ),
         inline=False,
     )
 
-    if RATE_LIMIT_ENABLED:
-        embed.add_field(
-            name="🚦 Rate Limits",
-            value=(
-                f"**Max Requests:** {RATE_LIMIT_MAX_REQUESTS} per {RATE_LIMIT_WINDOW}s\n"
-                "**Scope:** Per user, across all channels\n"
-                "**Purpose:** Prevent spam and ensure fair usage"
-            ),
-            inline=False,
-        )
-
     embed.set_footer(text="Data from Smogon University • Powered by pkmn.cc")
 
-    if isinstance(ctx, commands.Context):
-        await ctx.send(embed=embed)
-    else:
-        await ctx.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(name="ping", description="Check bot latency and response time")
@@ -1277,7 +841,6 @@ async def uptime(interaction: discord.Interaction):
 
         guild_count = len(bot.guilds)
         user_count = sum(g.member_count for g in bot.guilds if g.member_count)
-        latency = round(bot.latency * 1000)
 
         total_monitored = sum(
             len(config.channels) for config in bot.shiny_configs.values()
@@ -1291,15 +854,8 @@ async def uptime(interaction: discord.Interaction):
         )
 
         embed.add_field(name="⏰ Uptime", value=uptime_str, inline=True)
-        embed.add_field(name="🏓 Latency", value=f"{latency}ms", inline=True)
         embed.add_field(name="🌐 Servers", value=str(guild_count), inline=True)
         embed.add_field(name="👥 Users", value=f"{user_count:,}", inline=True)
-        embed.add_field(name="📦 Discord.py", value=discord.__version__, inline=True)
-        embed.add_field(
-            name="🐍 Python",
-            value=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-            inline=True,
-        )
 
         if TARGET_USER_ID:
             embed.add_field(
@@ -1308,19 +864,6 @@ async def uptime(interaction: discord.Interaction):
                     f"User: <@{TARGET_USER_ID}>\n"
                     f"Total Channels: {total_monitored}\n"
                     f"Servers w/ Archive: {guilds_with_archive}/{len(bot.shiny_configs)}"
-                ),
-                inline=False,
-            )
-
-        if RATE_LIMIT_ENABLED and global_rate_limiter:
-            rl_stats = global_rate_limiter.get_stats()
-            embed.add_field(
-                name="🚦 Rate Limiting",
-                value=(
-                    f"Status: **Enabled**\n"
-                    f"Users Tracked: {rl_stats['total_users_tracked']}\n"
-                    f"Currently Limited: {rl_stats['currently_limited']}\n"
-                    f"Block Rate: {rl_stats['block_rate']}"
                 ),
                 inline=False,
             )
@@ -1426,6 +969,115 @@ async def debug_message(interaction: discord.Interaction):
         await interaction.followup.send(full_text, ephemeral=True)
 
 
+@bot.tree.command(
+    name="shiny-archive",
+    description="Manage shiny archive channel for this server (Developer only)",
+)
+@discord.app_commands.describe(
+    action="Action to perform",
+    channel="Channel to set as archive (leave empty for current channel)",
+)
+@discord.app_commands.choices(
+    action=[
+        discord.app_commands.Choice(name="set", value="set"),
+        discord.app_commands.Choice(name="unset", value="unset"),
+        discord.app_commands.Choice(name="show", value="show"),
+    ]
+)
+async def shiny_archive(
+    interaction: discord.Interaction,
+    action: discord.app_commands.Choice[str],
+    channel: Optional[discord.TextChannel] = None,
+):
+    """Manage archive channel where shiny embeds are forwarded in this server"""
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ This command is only available to the bot owner.", ephemeral=True
+        )
+        return
+
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    guild_config = bot.get_guild_config(interaction.guild.id)
+    action_value = action.value
+
+    if action_value == "set":
+        target_channel = channel or interaction.channel
+        guild_config.embed_channel_id = target_channel.id
+        await save_shiny_configs(bot.shiny_configs)
+
+        await interaction.response.send_message(
+            f"✅ Set {target_channel.mention} as the shiny archive channel for **{interaction.guild.name}**.\n"
+            f"Shiny embeds will be forwarded here with jump links.",
+            ephemeral=True,
+        )
+        logger.info(
+            f"Set shiny archive channel to {target_channel.name} ({target_channel.id}) "
+            f"in guild {interaction.guild.name} ({interaction.guild.id})"
+        )
+
+    elif action_value == "unset":
+        if guild_config.embed_channel_id is None:
+            await interaction.response.send_message(
+                f"⚠️ No archive channel is currently set for **{interaction.guild.name}**.",
+                ephemeral=True,
+            )
+        else:
+            old_channel_id = guild_config.embed_channel_id
+            guild_config.embed_channel_id = None
+            await save_shiny_configs(bot.shiny_configs)
+
+            await interaction.response.send_message(
+                f"✅ Removed archive channel from **{interaction.guild.name}** (was: `{old_channel_id}`).\n"
+                f"Shiny embeds will no longer be forwarded.",
+                ephemeral=True,
+            )
+            logger.info(
+                f"Unset shiny archive channel (was: {old_channel_id}) "
+                f"in guild {interaction.guild.name} ({interaction.guild.id})"
+            )
+
+    elif action_value == "show":
+        if guild_config.embed_channel_id is None:
+            await interaction.response.send_message(
+                f"📋 No archive channel is currently configured for **{interaction.guild.name}**.\n"
+                "Use `/shiny-archive set` to set one.",
+                ephemeral=True,
+            )
+        else:
+            archive_channel = bot.get_channel(guild_config.embed_channel_id)
+
+            embed = discord.Embed(
+                title=f"📦 Shiny Archive - {interaction.guild.name}",
+                description="Shiny embeds are forwarded to this channel",
+                color=0xFFD700,
+            )
+
+            if archive_channel:
+                embed.add_field(
+                    name="Archive Channel",
+                    value=f"{archive_channel.mention} (`{guild_config.embed_channel_id}`)",
+                    inline=False,
+                )
+            else:
+                embed.add_field(
+                    name="Archive Channel",
+                    value=f"Unknown Channel (`{guild_config.embed_channel_id}`) - May have been deleted",
+                    inline=False,
+                )
+
+            embed.set_footer(
+                text=f"Configuration is specific to {interaction.guild.name}"
+            )
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 async def load_cogs():
     """Load all bot cogs"""
     cogs = ["cogs.smogon"]
@@ -1448,7 +1100,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user (KeyboardInterrupt)")
+        logger.info("Bot stopped by user")
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=e)
         sys.exit(1)

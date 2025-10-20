@@ -4,10 +4,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Setup logger for configuration warnings
 logger = logging.getLogger("smogon_bot.config")
 
 # Bot Configuration - Required
@@ -70,7 +68,7 @@ MAX_CACHE_SIZE = 200
 CACHE_CLEANUP_INTERVAL = 300
 CACHE_PERSIST_TO_DISK = True
 
-# Rate Limiting
+# API Rate Limiting (for external APIs, not user rate limiting)
 MAX_CONCURRENT_API_REQUESTS = 5
 API_REQUEST_TIMEOUT = 30
 
@@ -79,10 +77,10 @@ MAX_RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 1
 RETRY_MAX_DELAY = 10
 
-# Command Cooldowns (seconds)
-SMOGON_COMMAND_COOLDOWN = 5
-EFFORTVALUE_COMMAND_COOLDOWN = 3
-SPRITE_COMMAND_COOLDOWN = 3
+# Command Cooldowns (seconds) - These provide sufficient rate limiting
+SMOGON_COMMAND_COOLDOWN = 5  # User can use /smogon once every 5 seconds
+EFFORTVALUE_COMMAND_COOLDOWN = 3  # User can use /ev once every 3 seconds
+SPRITE_COMMAND_COOLDOWN = 3  # User can use /sprite once every 3 seconds
 DEFAULT_COMMAND_COOLDOWN = 5
 
 # Circuit Breaker Settings
@@ -142,8 +140,7 @@ TIER_MAP = {
     "nfe": "nfe",
 }
 
-# Comprehensive format lists by generation
-# Formats to try when searching (ordered by popularity)
+# Formats by generation (ordered by popularity)
 FORMATS_BY_GEN = {
     "gen9": [
         "ou",
@@ -215,7 +212,6 @@ FORMATS_BY_GEN = {
     "gen1": ["ou", "ubers", "uu"],
 }
 
-# Priority formats to check first (most common)
 PRIORITY_FORMATS = ["ou", "ubers", "uu", "doublesou"]
 
 # Format display names
@@ -278,8 +274,61 @@ TYPE_EMOJIS = {
     "stellar": "✨",
 }
 
-# Rate Limiting Configuration
-RATE_LIMIT_ENABLED = True
-RATE_LIMIT_MAX_REQUESTS = 15  # Max requests per user
-RATE_LIMIT_WINDOW = 60  # Time window in seconds (1 minute)
-RATE_LIMIT_CLEANUP_INTERVAL = 300  # Cleanup every 5 minutes
+
+def validate_settings():
+    """
+    Validate all configuration settings to catch errors at startup
+
+    Raises:
+        ValueError: If any configuration value is invalid
+    """
+    # Validate cache settings
+    if CACHE_TIMEOUT <= 0:
+        raise ValueError("CACHE_TIMEOUT must be positive")
+
+    if MAX_CACHE_SIZE < 1:
+        raise ValueError("MAX_CACHE_SIZE must be at least 1")
+
+    if CACHE_CLEANUP_INTERVAL <= 0:
+        raise ValueError("CACHE_CLEANUP_INTERVAL must be positive")
+
+    # Validate API settings
+    if MAX_CONCURRENT_API_REQUESTS < 1:
+        raise ValueError("MAX_CONCURRENT_API_REQUESTS must be at least 1")
+
+    if API_REQUEST_TIMEOUT <= 0:
+        raise ValueError("API_REQUEST_TIMEOUT must be positive")
+
+    # Validate retry settings
+    if MAX_RETRY_ATTEMPTS < 0:
+        raise ValueError("MAX_RETRY_ATTEMPTS must be non-negative")
+
+    if RETRY_BASE_DELAY < 0:
+        raise ValueError("RETRY_BASE_DELAY must be non-negative")
+
+    if RETRY_MAX_DELAY < RETRY_BASE_DELAY:
+        raise ValueError("RETRY_MAX_DELAY must be >= RETRY_BASE_DELAY")
+
+    # Validate cooldowns
+    if SMOGON_COMMAND_COOLDOWN < 0:
+        raise ValueError("SMOGON_COMMAND_COOLDOWN must be non-negative")
+
+    if EFFORTVALUE_COMMAND_COOLDOWN < 0:
+        raise ValueError("EFFORTVALUE_COMMAND_COOLDOWN must be non-negative")
+
+    if SPRITE_COMMAND_COOLDOWN < 0:
+        raise ValueError("SPRITE_COMMAND_COOLDOWN must be non-negative")
+
+    # Validate generation settings
+    if MAX_GENERATION < 1 or MAX_GENERATION > 9:
+        raise ValueError("MAX_GENERATION must be between 1 and 9")
+
+    # Validate circuit breaker settings
+    if CIRCUIT_BREAKER_ENABLED:
+        if CIRCUIT_BREAKER_FAILURE_THRESHOLD < 1:
+            raise ValueError("CIRCUIT_BREAKER_FAILURE_THRESHOLD must be at least 1")
+
+        if CIRCUIT_BREAKER_RECOVERY_TIMEOUT <= 0:
+            raise ValueError("CIRCUIT_BREAKER_RECOVERY_TIMEOUT must be positive")
+
+    logger.info("Configuration validation completed successfully")

@@ -15,6 +15,7 @@ DISCORD_EMBED_FOOTER_LIMIT = 2048
 DISCORD_EMBED_AUTHOR_LIMIT = 256
 DISCORD_EMBED_TOTAL_LIMIT = 6000
 DISCORD_EMBED_FIELD_COUNT_LIMIT = 25
+DISCORD_SELECT_MENU_LIMIT = 25  # NEW: Discord's select menu option limit
 
 # API Configuration
 DEFAULT_REQUEST_TIMEOUT = 30
@@ -26,6 +27,11 @@ RETRY_MAX_DELAY = 10  # seconds
 # Command Configuration
 DEFAULT_COMMAND_COOLDOWN = 2  # seconds
 COMMAND_COOLDOWN_RATE = 1  # uses per cooldown period
+
+# View/UI Configuration (FIXED: Added meaningful constants)
+VIEW_TIMEOUT_SECONDS = 180  # 3 minutes for interactive views
+ERROR_MESSAGE_LIFETIME = 15  # seconds before error messages auto-delete
+SUCCESS_MESSAGE_LIFETIME = 10  # seconds before success messages auto-delete
 
 # Input Validation
 MAX_POKEMON_NAME_LENGTH = 50

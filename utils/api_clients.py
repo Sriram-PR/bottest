@@ -66,7 +66,7 @@ class SmogonAPIClient:
         return DATA_DIR / "api_cache.pkl"
 
     def _load_cache_from_disk(self):
-        """Load cache from disk if available"""
+        """Load cache from disk if available (synchronous - called during init)"""
         cache_file = self._get_cache_file()
         if not cache_file.exists():
             logger.info("No existing cache file found - starting with empty cache")
@@ -102,8 +102,12 @@ class SmogonAPIClient:
             logger.error(f"❌ Error loading cache from disk: {e}")
             logger.info("Starting with empty cache")
 
-    def _save_cache_to_disk(self):
-        """Save cache to disk"""
+    def _save_cache_to_disk_sync(self):
+        """
+        Save cache to disk synchronously (internal method)
+
+        This is the actual blocking I/O operation that will be run in a thread pool
+        """
         if not CACHE_PERSIST_TO_DISK:
             return
 
@@ -119,6 +123,14 @@ class SmogonAPIClient:
         except Exception as e:
             logger.error(f"❌ Error saving cache to disk: {e}")
 
+    async def _save_cache_to_disk(self):
+        """
+        Save cache to disk asynchronously
+
+        FIXED: Now runs blocking I/O in thread pool to avoid blocking event loop
+        """
+        await asyncio.to_thread(self._save_cache_to_disk_sync)
+
     async def get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session with timeout configuration"""
         if self.session is None or self.session.closed:
@@ -128,9 +140,17 @@ class SmogonAPIClient:
                 headers={"User-Agent": "Pokemon-Smogon-Discord-Bot/2.0"},
             )
 
-            if self._cleanup_task is None or self._cleanup_task.done():
-                self._cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
-                logger.info("Started cache cleanup background task")
+            # FIXED: Cancel old cleanup task before creating new one
+            if self._cleanup_task and not self._cleanup_task.done():
+                self._cleanup_task.cancel()
+                try:
+                    await self._cleanup_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Start new cleanup task
+            self._cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
+            logger.info("Started cache cleanup background task")
 
         return self.session
 
@@ -138,8 +158,9 @@ class SmogonAPIClient:
         """Close the aiohttp session and cleanup tasks"""
         self._is_closing = True
 
+        # FIXED: Use async save instead of sync
         if CACHE_PERSIST_TO_DISK:
-            self._save_cache_to_disk()
+            await self._save_cache_to_disk()
 
         if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
@@ -167,16 +188,26 @@ class SmogonAPIClient:
                 logger.error(f"Error in cache cleanup task: {e}")
 
     def _cleanup_expired_cache(self):
-        """Remove expired entries from cache"""
+        """
+        Remove expired entries from cache
+
+        FIXED: Create snapshot of items to avoid race conditions during iteration
+        """
         current_time = time.time()
+
+        # FIXED: Create snapshot of cache items to avoid modification during iteration
+        cache_snapshot = list(self.cache.items())
+
         expired_keys = [
             key
-            for key, (_, timestamp) in self.cache.items()
+            for key, (_, timestamp) in cache_snapshot
             if current_time - timestamp > CACHE_TIMEOUT
         ]
 
         for key in expired_keys:
-            del self.cache[key]
+            # Check if key still exists (could have been modified by another operation)
+            if key in self.cache:
+                del self.cache[key]
 
         if expired_keys:
             logger.debug(f"Cleaned {len(expired_keys)} expired cache entries")
