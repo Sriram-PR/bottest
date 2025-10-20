@@ -10,7 +10,7 @@
         "sleepApplication": false,
         "useLegacyStacker": false,
         "multiRegionConfig": {
-            "us-east4": {
+            "us-east2": {
                 "numReplicas": 1
             }
         },
