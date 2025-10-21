@@ -160,6 +160,30 @@ def format_ivs(ivs: Dict[str, int]) -> Optional[str]:
     return " / ".join(formatted) if formatted else None
 
 
+def _format_field_generic(
+    field: Any, default: str = "—", none_value: str = "None"
+) -> str:
+    """
+    Generic formatter for ability/item/nature fields with slash options
+
+    Args:
+        field: Field value (string or list)
+        default: Default value for empty lists
+        none_value: Value to return if field is None/empty
+
+    Returns:
+        Formatted field string
+    """
+    if isinstance(field, list):
+        filtered = [str(f).strip() for f in field if f]
+        return " / ".join(filtered) if filtered else default
+
+    if field:
+        return str(field).strip()
+
+    return none_value
+
+
 def format_ability(ability: Any) -> str:
     """
     Format ability, handling slash options
@@ -170,17 +194,7 @@ def format_ability(ability: Any) -> str:
     Returns:
         Formatted ability string
     """
-    if isinstance(ability, list):
-        # Filter out empty strings
-        abilities = [str(a).strip() for a in ability if a]
-        if abilities:
-            return " / ".join(abilities)
-        return "—"
-
-    if ability:
-        return str(ability).strip()
-
-    return "—"
+    return _format_field_generic(ability, default="—", none_value="—")
 
 
 def format_item(item: Any) -> str:
@@ -193,9 +207,7 @@ def format_item(item: Any) -> str:
     Returns:
         Formatted item string
     """
-    if isinstance(item, list):
-        return " / ".join(item)
-    return str(item) if item else "None"
+    return _format_field_generic(item, default="None", none_value="None")
 
 
 def format_nature(nature: Any) -> str:
@@ -208,9 +220,7 @@ def format_nature(nature: Any) -> str:
     Returns:
         Formatted nature string
     """
-    if isinstance(nature, list):
-        return " / ".join(nature)
-    return str(nature) if nature else "Any"
+    return _format_field_generic(nature, default="Any", none_value="Any")
 
 
 def format_tera_type(tera: Any) -> Optional[str]:

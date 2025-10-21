@@ -22,6 +22,9 @@ from config.settings import (
 )
 from utils.constants import (
     ERROR_MESSAGE_LIFETIME,
+    HEALTHY_LATENCY_MS,
+    MAX_MESSAGE_HISTORY_FOR_DEBUG,
+    WARNING_LATENCY_MS,
 )
 
 # Validate configuration before proceeding
@@ -259,7 +262,11 @@ async def forward_shiny_to_archive(
         if not archive_channel:
             logger.warning(
                 f"Archive channel {guild_config.embed_channel_id} not found "
-                f"in {message.guild.name} (may have been deleted)"
+                f"in {message.guild.name} (may have been deleted)",
+                extra={
+                    "guild_id": message.guild.id,
+                    "channel_id": guild_config.embed_channel_id,
+                },
             )
             return
 
@@ -274,18 +281,34 @@ async def forward_shiny_to_archive(
 
         logger.info(
             f"Forwarded shiny embed to archive channel {archive_channel.name} "
-            f"in {message.guild.name}"
+            f"in {message.guild.name}",
+            extra={
+                "guild_id": message.guild.id,
+                "channel_id": archive_channel.id,
+                "message_id": message.id,
+            },
         )
 
     except discord.Forbidden:
         logger.error(
             f"No permission to send in archive channel "
-            f"{guild_config.embed_channel_id} in {message.guild.name}"
+            f"{guild_config.embed_channel_id} in {message.guild.name}",
+            extra={
+                "guild_id": message.guild.id,
+                "channel_id": guild_config.embed_channel_id,
+            },
         )
     except discord.HTTPException as e:
-        logger.error(f"HTTP error forwarding to archive: {e}")
+        logger.error(
+            f"HTTP error forwarding to archive: {e}",
+            extra={"guild_id": message.guild.id},
+        )
     except Exception as e:
-        logger.error(f"Unexpected error forwarding to archive: {e}", exc_info=True)
+        logger.error(
+            f"Unexpected error forwarding to archive: {e}",
+            extra={"guild_id": message.guild.id},
+            exc_info=True,
+        )
 
 
 @bot.event
@@ -386,7 +409,12 @@ async def on_message(message: discord.Message):
 
                 logger.info(
                     f"✨ Shiny detected in {message.guild.name}#{message.channel.name}! "
-                    f"Notification sent"
+                    f"Notification sent",
+                    extra={
+                        "guild_id": message.guild.id,
+                        "channel_id": message.channel.id,
+                        "message_id": message.id,
+                    },
                 )
 
                 if guild_config.embed_channel_id:
@@ -397,7 +425,15 @@ async def on_message(message: discord.Message):
                     )
 
     except Exception as e:
-        logger.error(f"Error in shiny detection: {e}", exc_info=True)
+        logger.error(
+            f"Error in shiny detection: {e}",
+            extra={
+                "guild_id": message.guild.id if message.guild else None,
+                "channel_id": message.channel.id,
+                "message_id": message.id,
+            },
+            exc_info=True,
+        )
 
     await bot.process_commands(message)
 
@@ -464,7 +500,13 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         )
     else:
         logger.error(
-            f"Unexpected error in command '{ctx.command}': {error}", exc_info=error
+            f"Unexpected error in command '{ctx.command}': {error}",
+            extra={
+                "command": ctx.command.name if ctx.command else "unknown",
+                "user_id": ctx.author.id,
+                "guild_id": ctx.guild.id if ctx.guild else None,
+            },
+            exc_info=error,
         )
         await ctx.send(
             "❌ An unexpected error occurred. Please try again later.",
@@ -496,7 +538,17 @@ async def on_app_command_error(
         perms = ", ".join(error.missing_permissions)
         error_message = f"❌ I don't have the required permissions!\nMissing: `{perms}`"
     else:
-        logger.error(f"Unexpected slash command error: {error}", exc_info=error)
+        logger.error(
+            f"Unexpected slash command error: {error}",
+            extra={
+                "command": interaction.command.name
+                if interaction.command
+                else "unknown",
+                "user_id": interaction.user.id,
+                "guild_id": interaction.guild_id,
+            },
+            exc_info=error,
+        )
         error_message = "❌ An unexpected error occurred. Please try again later."
 
     try:
@@ -539,15 +591,9 @@ async def cache_stats(interaction: discord.Interaction):
         timestamp=interaction.created_at,
     )
 
-    size_percent = (stats["size"] / stats["max_size"]) * 100
-    size_bar = "█" * int(size_percent / 10) + "░" * (10 - int(size_percent / 10))
-
     embed.add_field(
         name="💾 Cache Size",
-        value=(
-            f"```{stats['size']:,} / {stats['max_size']:,} entries```\n"
-            f"{size_bar} **{size_percent:.1f}%**"
-        ),
+        value=(f"```{stats['size']:,} / {stats['max_size']:,} entries```\n"),
         inline=False,
     )
 
@@ -597,7 +643,7 @@ async def cache_clear(interaction: discord.Interaction):
     api_client = smogon_cog.api_client
     old_stats = api_client.get_cache_stats()
 
-    api_client.clear_cache()
+    await api_client.clear_cache()
 
     embed = discord.Embed(
         title="✅ Cache Cleared",
@@ -733,242 +779,6 @@ async def shiny_channel(
         )
 
 
-# Similar shiny-archive command follows...
-# (keeping code concise - same pattern as above)
-
-
-# ========================================
-# GENERAL BOT COMMANDS
-# ========================================
-
-
-@bot.hybrid_command(name="help", description="Show bot commands and usage")
-async def help_command(ctx: commands.Context):
-    """Display help information"""
-    embed = discord.Embed(
-        title="🎮 Pokemon Smogon Bot - Help",
-        description="Get competitive Pokemon movesets from Smogon University",
-        color=0xFF7BA9,
-    )
-
-    embed.add_field(
-        name="📖 Commands",
-        value=(
-            "`/smogon <pokemon> [generation] [tier]`\n"
-            "`/effortvalue <pokemon>`\n"
-            "`/sprite <pokemon> [shiny] [generation]`\n"
-            "`/dmgcalc` - Damage calculator link\n"
-            "`/ping` - Check bot latency\n"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(text="Data from Smogon University • Powered by pkmn.cc")
-
-    await ctx.send(embed=embed)
-
-
-@bot.hybrid_command(name="ping", description="Check bot latency and response time")
-async def ping(ctx: commands.Context):
-    """Check bot's latency"""
-    import time
-
-    # WebSocket latency
-    ws_latency = round(bot.latency * 1000, 2)
-
-    if ctx.interaction:
-        # Slash command - ephemeral
-        start_time = time.perf_counter()
-        await ctx.defer(ephemeral=True)
-        api_latency = round((time.perf_counter() - start_time) * 1000, 2)
-
-        embed = discord.Embed(color=0x2B2D31)
-        embed.add_field(
-            name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
-        )
-        embed.add_field(
-            name="API Response Time", value=f"```{api_latency} ms```", inline=True
-        )
-
-        await ctx.send(embed=embed)
-    else:
-        # Prefix command - normal message
-        start_time = time.perf_counter()
-
-        embed = discord.Embed(color=0x2B2D31)
-        embed.add_field(
-            name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
-        )
-        embed.add_field(name="API Response Time", value="```...```", inline=True)
-
-        msg = await ctx.send(embed=embed)
-        api_latency = round((time.perf_counter() - start_time) * 1000, 2)
-
-        # Update with actual API latency
-        embed.set_field_at(
-            1, name="API Response Time", value=f"```{api_latency} ms```", inline=True
-        )
-        await msg.edit(embed=embed)
-
-
-@bot.tree.command(name="uptime", description="Check bot uptime (Developer only)")
-async def uptime(interaction: discord.Interaction):
-    """Check bot's uptime - Developer only"""
-
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message(
-            "❌ This command is only available to the bot owner.", ephemeral=True
-        )
-        return
-
-    if bot.start_time:
-        uptime_seconds = int(time.time() - bot.start_time)
-
-        days, remainder = divmod(uptime_seconds, 86400)
-        hours, remainder = divmod(remainder, 3600)
-        minutes, seconds = divmod(remainder, 60)
-
-        uptime_parts = []
-        if days > 0:
-            uptime_parts.append(f"{days}d")
-        if hours > 0:
-            uptime_parts.append(f"{hours}h")
-        if minutes > 0:
-            uptime_parts.append(f"{minutes}m")
-        uptime_parts.append(f"{seconds}s")
-
-        uptime_str = " ".join(uptime_parts)
-
-        guild_count = len(bot.guilds)
-        user_count = sum(g.member_count for g in bot.guilds if g.member_count)
-
-        total_monitored = sum(
-            len(config.channels) for config in bot.shiny_configs.values()
-        )
-        guilds_with_archive = sum(
-            1 for config in bot.shiny_configs.values() if config.embed_channel_id
-        )
-
-        embed = discord.Embed(
-            title="🤖 Bot Status", color=0x00FF00, timestamp=interaction.created_at
-        )
-
-        embed.add_field(name="⏰ Uptime", value=uptime_str, inline=True)
-        embed.add_field(name="🌐 Servers", value=str(guild_count), inline=True)
-        embed.add_field(name="👥 Users", value=f"{user_count:,}", inline=True)
-
-        if TARGET_USER_ID:
-            embed.add_field(
-                name="🌟 Shiny Monitoring",
-                value=(
-                    f"User: <@{TARGET_USER_ID}>\n"
-                    f"Total Channels: {total_monitored}\n"
-                    f"Servers w/ Archive: {guilds_with_archive}/{len(bot.shiny_configs)}"
-                ),
-                inline=False,
-            )
-
-        embed.set_footer(text=f"Bot Owner: {interaction.user.name}")
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(
-            "⏰ Uptime tracking not available.", ephemeral=True
-        )
-
-
-@bot.tree.command(
-    name="debug-message",
-    description="Debug the last message from target user (Owner only)",
-)
-async def debug_message(interaction: discord.Interaction):
-    """Debug shiny detection by showing ALL embed fields"""
-
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("❌ Owner only!", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    messages = []
-    async for msg in interaction.channel.history(limit=50):
-        if msg.author.id == TARGET_USER_ID:
-            messages.append(msg)
-
-    if not messages:
-        await interaction.followup.send(
-            "No messages from target user found!", ephemeral=True
-        )
-        return
-
-    last_msg = messages[0]
-
-    debug_info = [
-        "**Last Message from Target User**",
-        f"Author: {last_msg.author.name} (ID: {last_msg.author.id})",
-        f"Message ID: {last_msg.id}",
-        f"Channel: #{last_msg.channel.name}",
-        "",
-        f"**Embeds:** {len(last_msg.embeds)}",
-    ]
-
-    if last_msg.embeds:
-        for idx, embed in enumerate(last_msg.embeds):
-            debug_info.append("")
-            debug_info.append(f"**═══ Embed {idx + 1} ═══**")
-
-            if embed.title:
-                debug_info.append(f"**Title:** `{embed.title}`")
-
-            if embed.author:
-                debug_info.append(f"**Author Name:** `{embed.author.name}`")
-                debug_info.append(f"**Author Icon:** {embed.author.icon_url or 'None'}")
-
-            if embed.description:
-                desc_preview = embed.description[:200]
-                debug_info.append(f"**Description:**\n```{desc_preview}```")
-
-            if embed.footer:
-                debug_info.append(f"**Footer Text:** `{embed.footer.text}`")
-
-            if embed.image:
-                debug_info.append(f"**Image URL:** {embed.image.url[:50]}...")
-
-            debug_info.append("")
-            debug_info.append("**🔍 PATTERN TESTS:**")
-
-            # Test description (PRIMARY CHECK)
-            if embed.description:
-                match = SHINY_PATTERN.search(embed.description)
-                debug_info.append(f"**Description match: `{match is not None}`**")
-                if match:
-                    debug_info.append(f"**✅ SHINY FOUND: `{match.group()}`**")
-                else:
-                    debug_info.append("❌ No shiny pattern in description")
-
-            # Test title
-            if embed.title:
-                match = SHINY_PATTERN.search(embed.title)
-                debug_info.append(f"Title match: `{match is not None}`")
-
-            # Test author name
-            if embed.author and embed.author.name:
-                match = SHINY_PATTERN.search(embed.author.name)
-                debug_info.append(f"Author.name match: `{match is not None}`")
-    else:
-        debug_info.append("No embeds!")
-
-    full_text = "\n".join(debug_info)
-
-    # Split into chunks if too long
-    if len(full_text) > 2000:
-        chunks = [full_text[i : i + 2000] for i in range(0, len(full_text), 2000)]
-        for chunk in chunks:
-            await interaction.followup.send(chunk, ephemeral=True)
-    else:
-        await interaction.followup.send(full_text, ephemeral=True)
-
-
 @bot.tree.command(
     name="shiny-archive",
     description="Manage shiny archive channel for this server (Developer only)",
@@ -1076,6 +886,305 @@ async def shiny_archive(
             )
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ========================================
+# GENERAL BOT COMMANDS
+# ========================================
+
+
+@bot.hybrid_command(name="help", description="Show bot commands and usage")
+async def help_command(ctx: commands.Context):
+    """Display help information"""
+    embed = discord.Embed(
+        title="🎮 Pokemon Smogon Bot - Help",
+        description="Get competitive Pokemon movesets from Smogon University",
+        color=0xFF7BA9,
+    )
+
+    embed.add_field(
+        name="📖 Commands",
+        value=(
+            "`/smogon <pokemon> [generation] [tier]`\n"
+            "`/effortvalue <pokemon>`\n"
+            "`/sprite <pokemon> [shiny] [generation]`\n"
+            "`/dmgcalc` - Damage calculator link\n"
+            "`/ping` - Check bot latency\n"
+            "`/status` - Check bot health\n"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="Data from Smogon University • Powered by pkmn.cc")
+
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="ping", description="Check bot latency and response time")
+async def ping(ctx: commands.Context):
+    """Check bot's latency"""
+    import time
+
+    # WebSocket latency
+    ws_latency = round(bot.latency * 1000, 2)
+
+    if ctx.interaction:
+        # Slash command - ephemeral
+        start_time = time.perf_counter()
+        await ctx.defer(ephemeral=True)
+        api_latency = round((time.perf_counter() - start_time) * 1000, 2)
+
+        embed = discord.Embed(color=0x2B2D31)
+        embed.add_field(
+            name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
+        )
+        embed.add_field(
+            name="API Response Time", value=f"```{api_latency} ms```", inline=True
+        )
+
+        await ctx.send(embed=embed)
+    else:
+        # Prefix command - normal message
+        start_time = time.perf_counter()
+
+        embed = discord.Embed(color=0x2B2D31)
+        embed.add_field(
+            name="WebSocket Latency", value=f"```{ws_latency} ms```", inline=True
+        )
+        embed.add_field(name="API Response Time", value="```...```", inline=True)
+
+        msg = await ctx.send(embed=embed)
+        api_latency = round((time.perf_counter() - start_time) * 1000, 2)
+
+        # Update with actual API latency
+        embed.set_field_at(
+            1, name="API Response Time", value=f"```{api_latency} ms```", inline=True
+        )
+        await msg.edit(embed=embed)
+
+
+@bot.tree.command(name="uptime", description="Check bot uptime (Developer only)")
+async def uptime(interaction: discord.Interaction):
+    """Check how long the bot has been online - Developer only"""
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "❌ This command is only available to the bot owner.", ephemeral=True
+        )
+        return
+
+    if bot.start_time:
+        uptime_seconds = int(time.time() - bot.start_time)
+
+        days, remainder = divmod(uptime_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        uptime_parts = []
+        if days > 0:
+            uptime_parts.append(f"{days}d")
+        if hours > 0:
+            uptime_parts.append(f"{hours}h")
+        if minutes > 0:
+            uptime_parts.append(f"{minutes}m")
+        uptime_parts.append(f"{seconds}s")
+
+        uptime_str = " ".join(uptime_parts)
+
+        embed = discord.Embed(
+            title="⏰ Bot Uptime",
+            description=f"```{uptime_str}```",
+            color=0x00FF00,
+            timestamp=interaction.created_at,
+        )
+
+        embed.set_footer(text="Time since last restart")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "⏰ Uptime tracking not available.", ephemeral=True
+        )
+
+
+@bot.tree.command(name="status", description="Check bot health and system status")
+async def status(interaction: discord.Interaction):
+    """Check bot's current health and system status"""
+
+    # Get latency
+    ws_latency_ms = round(bot.latency * 1000, 2)
+
+    # Determine health status based on latency
+    if ws_latency_ms < HEALTHY_LATENCY_MS:
+        status_emoji = "🟢"
+        status_text = "Healthy"
+        color = 0x00FF00
+    elif ws_latency_ms < WARNING_LATENCY_MS:
+        status_emoji = "🟡"
+        status_text = "Warning"
+        color = 0xFFFF00
+    else:
+        status_emoji = "🔴"
+        status_text = "Critical"
+        color = 0xFF0000
+
+    embed = discord.Embed(
+        title=f"{status_emoji} Bot Status",
+        description=f"**System Health:** {status_text}",
+        color=color,
+        timestamp=interaction.created_at,
+    )
+
+    # Latency
+    embed.add_field(
+        name="⚡ Latency",
+        value=f"```{ws_latency_ms} ms```",
+        inline=True,
+    )
+
+    # Guild/User count
+    guild_count = len(bot.guilds)
+    user_count = sum(g.member_count for g in bot.guilds if g.member_count)
+    embed.add_field(
+        name="🌐 Reach",
+        value=f"```{guild_count} servers\n{user_count:,} users```",
+        inline=True,
+    )
+
+    # Uptime
+    if bot.start_time:
+        uptime_seconds = int(time.time() - bot.start_time)
+        days, remainder = divmod(uptime_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        uptime_str = f"{days}d {hours}h {minutes}m"
+        embed.add_field(
+            name="⏰ Uptime",
+            value=f"```{uptime_str}```",
+            inline=True,
+        )
+
+    # Cache stats (if available)
+    smogon_cog = bot.get_cog("Smogon")
+    if smogon_cog and hasattr(smogon_cog, "api_client"):
+        stats = smogon_cog.api_client.get_cache_stats()
+        embed.add_field(
+            name="💾 Cache",
+            value=f"```{stats['size']}/{stats['max_size']} entries\nHit rate: {stats['hit_rate']}```",
+            inline=True,
+        )
+
+    # Shiny monitoring (if enabled)
+    if TARGET_USER_ID:
+        total_monitored = sum(
+            len(config.channels) for config in bot.shiny_configs.values()
+        )
+        embed.add_field(
+            name="🌟 Shiny Watch",
+            value=f"```{total_monitored} channels\n{len(bot.shiny_configs)} servers```",
+            inline=True,
+        )
+
+    embed.set_footer(
+        text="All systems operational"
+        if status_text == "Healthy"
+        else "Performance degraded"
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="debug-message",
+    description="Debug the last message from target user (Owner only)",
+)
+async def debug_message(interaction: discord.Interaction):
+    """Debug shiny detection by showing ALL embed fields"""
+
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Owner only!", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    messages = []
+    async for msg in interaction.channel.history(limit=MAX_MESSAGE_HISTORY_FOR_DEBUG):
+        if msg.author.id == TARGET_USER_ID:
+            messages.append(msg)
+
+    if not messages:
+        await interaction.followup.send(
+            "No messages from target user found!", ephemeral=True
+        )
+        return
+
+    last_msg = messages[0]
+
+    debug_info = [
+        "**Last Message from Target User**",
+        f"Author: {last_msg.author.name} (ID: {last_msg.author.id})",
+        f"Message ID: {last_msg.id}",
+        f"Channel: #{last_msg.channel.name}",
+        "",
+        f"**Embeds:** {len(last_msg.embeds)}",
+    ]
+
+    if last_msg.embeds:
+        for idx, embed in enumerate(last_msg.embeds):
+            debug_info.append("")
+            debug_info.append(f"**═══ Embed {idx + 1} ═══**")
+
+            if embed.title:
+                debug_info.append(f"**Title:** `{embed.title}`")
+
+            if embed.author:
+                debug_info.append(f"**Author Name:** `{embed.author.name}`")
+                debug_info.append(f"**Author Icon:** {embed.author.icon_url or 'None'}")
+
+            if embed.description:
+                desc_preview = embed.description[:200]
+                debug_info.append(f"**Description:**\n```{desc_preview}```")
+
+            if embed.footer:
+                debug_info.append(f"**Footer Text:** `{embed.footer.text}`")
+
+            if embed.image:
+                debug_info.append(f"**Image URL:** {embed.image.url[:50]}...")
+
+            debug_info.append("")
+            debug_info.append("**🔍 PATTERN TESTS:**")
+
+            # Test description (PRIMARY CHECK)
+            if embed.description:
+                match = SHINY_PATTERN.search(embed.description)
+                debug_info.append(f"**Description match: `{match is not None}`**")
+                if match:
+                    debug_info.append(f"**✅ SHINY FOUND: `{match.group()}`**")
+                else:
+                    debug_info.append("❌ No shiny pattern in description")
+
+            # Test title
+            if embed.title:
+                match = SHINY_PATTERN.search(embed.title)
+                debug_info.append(f"Title match: `{match is not None}`")
+
+            # Test author name
+            if embed.author and embed.author.name:
+                match = SHINY_PATTERN.search(embed.author.name)
+                debug_info.append(f"Author.name match: `{match is not None}`")
+    else:
+        debug_info.append("No embeds!")
+
+    full_text = "\n".join(debug_info)
+
+    # Split into chunks if too long
+    if len(full_text) > 2000:
+        chunks = [full_text[i : i + 2000] for i in range(0, len(full_text), 2000)]
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True)
+    else:
+        await interaction.followup.send(full_text, ephemeral=True)
 
 
 async def load_cogs():

@@ -130,7 +130,15 @@ class Smogon(commands.Cog):
                 all_formats = {tier_normalized: sets_data}
 
             except Exception as e:
-                logger.error(f"Error fetching {tier_normalized}: {e}", exc_info=True)
+                logger.error(
+                    f"Error fetching {tier_normalized}: {e}",
+                    extra={
+                        "pokemon": pokemon,
+                        "generation": gen_normalized,
+                        "tier": tier_normalized,
+                    },
+                    exc_info=True,
+                )
                 embed = create_error_embed(
                     "Error",
                     f"Failed to fetch data for **{tier_normalized.upper()}**. "
@@ -158,7 +166,11 @@ class Smogon(commands.Cog):
                     return
 
             except Exception as e:
-                logger.error(f"Error searching formats: {e}", exc_info=True)
+                logger.error(
+                    f"Error searching formats: {e}",
+                    extra={"pokemon": pokemon, "generation": gen_normalized},
+                    exc_info=True,
+                )
                 embed = create_error_embed(
                     "Error",
                     "An error occurred while searching. Please try again later.",
@@ -230,7 +242,11 @@ class Smogon(commands.Cog):
             await ctx.send(embed=embed)
 
         except Exception as e:
-            logger.error(f"Error in EV command: {e}", exc_info=True)
+            logger.error(
+                f"Error in EV command: {e}",
+                extra={"pokemon": pokemon},
+                exc_info=True,
+            )
             embed = create_error_embed(
                 "Error",
                 "An error occurred. Please try again later.",
@@ -336,7 +352,15 @@ class Smogon(commands.Cog):
             await ctx.send(embed=embed)
 
         except Exception as e:
-            logger.error(f"Error in sprite command: {e}", exc_info=True)
+            logger.error(
+                f"Error in sprite command: {e}",
+                extra={
+                    "pokemon": pokemon,
+                    "shiny": shiny_bool,
+                    "generation": generation,
+                },
+                exc_info=True,
+            )
             embed = create_error_embed(
                 "Error",
                 "An error occurred. Please try again later.",
@@ -619,7 +643,15 @@ class SetSelectorView(discord.ui.View):
             await interaction.edit_original_response(embed=embed, view=self)
 
         except Exception as e:
-            logger.error(f"Error in generation callback: {e}", exc_info=True)
+            logger.error(
+                f"Error in generation callback: {e}",
+                extra={
+                    "pokemon": self.pokemon,
+                    "generation": selected_gen,
+                    "user_id": interaction.user.id,
+                },
+                exc_info=True,
+            )
             embed = create_error_embed(
                 "Error",
                 "An error occurred while switching generations.",
@@ -679,7 +711,7 @@ class SetSelectorView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def on_timeout(self):
-        """Remove buttons when view times out"""
+        """Remove buttons when view times out (FIXED: Memory leak prevention)"""
         if self.message:
             try:
                 await self.message.edit(view=None)
@@ -690,6 +722,11 @@ class SetSelectorView(discord.ui.View):
                 logger.error(f"Error removing buttons on timeout: {e}")
             except Exception as e:
                 logger.error(f"Unexpected error in on_timeout: {e}")
+            finally:
+                # FIXED: Release message reference to prevent memory leak
+                self.message = None
+                # FIXED: Explicitly stop the view
+                self.stop()
 
 
 async def setup(bot: commands.Bot):

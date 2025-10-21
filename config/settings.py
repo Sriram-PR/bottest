@@ -12,7 +12,14 @@ logger = logging.getLogger("smogon_bot.config")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise ValueError(
-        "❌ DISCORD_TOKEN not found in .env file! Please add it to continue."
+        "❌ DISCORD_TOKEN not found in environment variables!\n\n"
+        "Please create a .env file in the project root with:\n"
+        "  DISCORD_TOKEN=your_token_here\n\n"
+        "Get your token from: https://discord.com/developers/applications\n"
+        "1. Create/select your application\n"
+        "2. Go to 'Bot' section\n"
+        "3. Click 'Reset Token' to get your token\n"
+        "4. Copy it to your .env file"
     )
 
 # Bot Configuration - Optional
@@ -25,10 +32,19 @@ if OWNER_ID:
     try:
         OWNER_ID = int(OWNER_ID)
     except ValueError:
-        raise ValueError("❌ OWNER_ID must be a valid integer!")
+        raise ValueError(
+            "❌ OWNER_ID must be a valid integer (your Discord user ID)!\n\n"
+            "To find your Discord ID:\n"
+            "1. Enable Developer Mode (User Settings > Advanced > Developer Mode)\n"
+            "2. Right-click your username\n"
+            "3. Click 'Copy User ID'\n"
+            "4. Add to .env file: OWNER_ID=your_id_here"
+        )
 else:
     OWNER_ID = 0
-    logger.warning("⚠️  OWNER_ID not set - admin commands will be unavailable")
+    logger.warning(
+        "⚠️  OWNER_ID not set - admin commands (/uptime, /cache-stats, etc.) will be unavailable"
+    )
 
 # Target User ID (for shiny monitoring)
 TARGET_USER_ID = os.getenv("TARGET_USER_ID")
@@ -36,7 +52,14 @@ if TARGET_USER_ID:
     try:
         TARGET_USER_ID = int(TARGET_USER_ID)
     except ValueError:
-        raise ValueError("❌ TARGET_USER_ID must be a valid integer!")
+        raise ValueError(
+            "❌ TARGET_USER_ID must be a valid integer (Pokemon bot's Discord ID)!\n\n"
+            "To find a bot's Discord ID:\n"
+            "1. Enable Developer Mode (User Settings > Advanced > Developer Mode)\n"
+            "2. Right-click the bot's username\n"
+            "3. Click 'Copy User ID'\n"
+            "4. Add to .env file: TARGET_USER_ID=bot_id_here"
+        )
 else:
     TARGET_USER_ID = 0
     logger.warning("⚠️  TARGET_USER_ID not set - shiny monitoring will be disabled")
@@ -331,4 +354,4 @@ def validate_settings():
         if CIRCUIT_BREAKER_RECOVERY_TIMEOUT <= 0:
             raise ValueError("CIRCUIT_BREAKER_RECOVERY_TIMEOUT must be positive")
 
-    logger.info("Configuration validation completed successfully")
+    logger.info("✅ Configuration validation completed successfully")

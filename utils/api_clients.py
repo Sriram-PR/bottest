@@ -31,7 +31,7 @@ class SmogonAPIClient:
     Client for fetching competitive sets from Smogon and Pokemon data from PokeAPI
 
     Features:
-    - LRU cache with size limit and auto-cleanup
+    - Thread-safe LRU cache with size limit and auto-cleanup
     - Disk-based cache persistence across restarts
     - Rate limiting with semaphore
     - Automatic retry on failures
@@ -43,8 +43,12 @@ class SmogonAPIClient:
         self.base_url = SMOGON_SETS_URL
         self.session: Optional[aiohttp.ClientSession] = None
 
-        # LRU cache using OrderedDict
+        # LRU cache using OrderedDict with thread-safe access
         self.cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
+        self._cache_lock = asyncio.Lock()
+
+        # Session creation lock to prevent race conditions
+        self._session_lock = asyncio.Lock()
 
         # Rate limiting
         self._rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_API_REQUESTS)
@@ -124,33 +128,30 @@ class SmogonAPIClient:
             logger.error(f"❌ Error saving cache to disk: {e}")
 
     async def _save_cache_to_disk(self):
-        """
-        Save cache to disk asynchronously
-
-        FIXED: Now runs blocking I/O in thread pool to avoid blocking event loop
-        """
+        """Save cache to disk asynchronously (runs blocking I/O in thread pool)"""
         await asyncio.to_thread(self._save_cache_to_disk_sync)
 
     async def get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session with timeout configuration"""
-        if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=API_REQUEST_TIMEOUT)
-            self.session = aiohttp.ClientSession(
-                timeout=timeout,
-                headers={"User-Agent": "Pokemon-Smogon-Discord-Bot/2.0"},
-            )
+        """Get or create aiohttp session with timeout configuration (thread-safe)"""
+        async with self._session_lock:
+            if self.session is None or self.session.closed:
+                timeout = aiohttp.ClientTimeout(total=API_REQUEST_TIMEOUT)
+                self.session = aiohttp.ClientSession(
+                    timeout=timeout,
+                    headers={"User-Agent": "Pokemon-Smogon-Discord-Bot/2.0"},
+                )
 
-            # FIXED: Cancel old cleanup task before creating new one
-            if self._cleanup_task and not self._cleanup_task.done():
-                self._cleanup_task.cancel()
-                try:
-                    await self._cleanup_task
-                except asyncio.CancelledError:
-                    pass
+                # Cancel old cleanup task before creating new one
+                if self._cleanup_task and not self._cleanup_task.done():
+                    self._cleanup_task.cancel()
+                    try:
+                        await self._cleanup_task
+                    except asyncio.CancelledError:
+                        pass
 
-            # Start new cleanup task
-            self._cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
-            logger.info("Started cache cleanup background task")
+                # Start new cleanup task
+                self._cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
+                logger.info("Started cache cleanup background task")
 
         return self.session
 
@@ -158,7 +159,7 @@ class SmogonAPIClient:
         """Close the aiohttp session and cleanup tasks"""
         self._is_closing = True
 
-        # FIXED: Use async save instead of sync
+        # Save cache before shutdown
         if CACHE_PERSIST_TO_DISK:
             await self._save_cache_to_disk()
 
@@ -181,62 +182,61 @@ class SmogonAPIClient:
         while not self._is_closing:
             try:
                 await asyncio.sleep(CACHE_CLEANUP_INTERVAL)
-                self._cleanup_expired_cache()
+                await self._cleanup_expired_cache()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in cache cleanup task: {e}")
 
-    def _cleanup_expired_cache(self):
-        """
-        Remove expired entries from cache
+    async def _cleanup_expired_cache(self):
+        """Remove expired entries from cache (thread-safe)"""
+        async with self._cache_lock:
+            current_time = time.time()
 
-        FIXED: Create snapshot of items to avoid race conditions during iteration
-        """
-        current_time = time.time()
+            # Create snapshot of cache items to avoid modification during iteration
+            cache_snapshot = list(self.cache.items())
 
-        # FIXED: Create snapshot of cache items to avoid modification during iteration
-        cache_snapshot = list(self.cache.items())
+            expired_keys = [
+                key
+                for key, (_, timestamp) in cache_snapshot
+                if current_time - timestamp > CACHE_TIMEOUT
+            ]
 
-        expired_keys = [
-            key
-            for key, (_, timestamp) in cache_snapshot
-            if current_time - timestamp > CACHE_TIMEOUT
-        ]
+            for key in expired_keys:
+                # Check if key still exists (could have been modified by another operation)
+                if key in self.cache:
+                    del self.cache[key]
 
-        for key in expired_keys:
-            # Check if key still exists (could have been modified by another operation)
+            if expired_keys:
+                logger.debug(f"Cleaned {len(expired_keys)} expired cache entries")
+
+    async def _get_cached(self, key: str) -> Optional[Any]:
+        """Get data from cache if not expired (LRU, thread-safe)"""
+        async with self._cache_lock:
             if key in self.cache:
-                del self.cache[key]
+                data, timestamp = self.cache[key]
+                if time.time() - timestamp < CACHE_TIMEOUT:
+                    self.cache.move_to_end(key)
+                    self.cache_hits += 1
+                    logger.debug(f"Cache hit for {key}")
+                    return data
+                else:
+                    del self.cache[key]
+                    logger.debug(f"Cache expired for {key}")
 
-        if expired_keys:
-            logger.debug(f"Cleaned {len(expired_keys)} expired cache entries")
+            self.cache_misses += 1
+            return None
 
-    def _get_cached(self, key: str) -> Optional[Any]:
-        """Get data from cache if not expired (LRU)"""
-        if key in self.cache:
-            data, timestamp = self.cache[key]
-            if time.time() - timestamp < CACHE_TIMEOUT:
-                self.cache.move_to_end(key)
-                self.cache_hits += 1
-                logger.debug(f"Cache hit for {key}")
-                return data
-            else:
-                del self.cache[key]
-                logger.debug(f"Cache expired for {key}")
+    async def _set_cache(self, key: str, data: Any):
+        """Store data in cache with timestamp (LRU with size limit, thread-safe)"""
+        async with self._cache_lock:
+            while len(self.cache) >= MAX_CACHE_SIZE:
+                oldest_key = next(iter(self.cache))
+                del self.cache[oldest_key]
+                logger.debug(f"Evicted cache entry: {oldest_key}")
 
-        self.cache_misses += 1
-        return None
-
-    def _set_cache(self, key: str, data: Any):
-        """Store data in cache with timestamp (LRU with size limit)"""
-        while len(self.cache) >= MAX_CACHE_SIZE:
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
-            logger.debug(f"Evicted cache entry: {oldest_key}")
-
-        self.cache[key] = (data, time.time())
-        logger.debug(f"Cached data for {key}")
+            self.cache[key] = (data, time.time())
+            logger.debug(f"Cached data for {key}")
 
     @retry_on_error(max_retries=3)
     async def find_pokemon_in_generation(
@@ -254,7 +254,7 @@ class SmogonAPIClient:
         """
         # Check if we have cached tier locations for this pokemon
         tier_cache_key = f"tier_location:{generation}:{pokemon}"
-        cached_tiers = self._get_cached(tier_cache_key)
+        cached_tiers = await self._get_cached(tier_cache_key)
 
         if cached_tiers:
             logger.info(f"Using cached tier locations for {pokemon} in {generation}")
@@ -289,7 +289,7 @@ class SmogonAPIClient:
 
         # Cache tier locations if found
         if found_formats:
-            self._set_cache(tier_cache_key, list(found_formats.keys()))
+            await self._set_cache(tier_cache_key, list(found_formats.keys()))
 
         return found_formats
 
@@ -326,7 +326,7 @@ class SmogonAPIClient:
         format_id = f"{generation}{tier}"
         cache_key = f"{format_id}:{pokemon}"
 
-        cached = self._get_cached(cache_key)
+        cached = await self._get_cached(cache_key)
         if cached is not None:
             return cached
 
@@ -344,14 +344,14 @@ class SmogonAPIClient:
                         # Search for Pokemon
                         for poke_name, sets in data.items():
                             if poke_name.lower().replace(" ", "-") == pokemon:
-                                self._set_cache(cache_key, sets)
+                                await self._set_cache(cache_key, sets)
                                 logger.info(f"Found sets for {pokemon} in {format_id}")
                                 return sets
 
                         # Partial match
                         for poke_name, sets in data.items():
                             if pokemon in poke_name.lower().replace(" ", "-"):
-                                self._set_cache(cache_key, sets)
+                                await self._set_cache(cache_key, sets)
                                 logger.info(
                                     f"Found sets for {pokemon} (matched {poke_name}) in {format_id}"
                                 )
@@ -384,7 +384,7 @@ class SmogonAPIClient:
         """Fetch EV yield data from PokeAPI"""
         pokemon = pokemon.lower().strip().replace(" ", "-")
         cache_key = f"ev_yield:{pokemon}"
-        cached = self._get_cached(cache_key)
+        cached = await self._get_cached(cache_key)
         if cached is not None:
             return cached
 
@@ -415,7 +415,7 @@ class SmogonAPIClient:
                             "types": [t["type"]["name"] for t in data.get("types", [])],
                         }
 
-                        self._set_cache(cache_key, result)
+                        await self._set_cache(cache_key, result)
                         logger.info(f"Found EV yield for {pokemon}")
                         return result
                     elif resp.status == 404:
@@ -435,7 +435,7 @@ class SmogonAPIClient:
         """Fetch Pokemon sprite from PokeAPI"""
         pokemon = pokemon.lower().strip().replace(" ", "-")
         cache_key = f"sprite:{pokemon}:{shiny}:{generation}"
-        cached = self._get_cached(cache_key)
+        cached = await self._get_cached(cache_key)
         if cached is not None:
             return cached
 
@@ -524,7 +524,7 @@ class SmogonAPIClient:
                             "generation": generation,
                         }
 
-                        self._set_cache(cache_key, result)
+                        await self._set_cache(cache_key, result)
                         logger.info(f"Found sprite for {pokemon}")
                         return result
                     elif resp.status == 404:
@@ -537,12 +537,13 @@ class SmogonAPIClient:
             logger.error(f"Error fetching sprite for {pokemon}: {e}", exc_info=True)
             return None
 
-    def clear_cache(self):
-        """Clear all cached data"""
-        self.cache.clear()
-        self.cache_hits = 0
-        self.cache_misses = 0
-        logger.info("Cache cleared")
+    async def clear_cache(self):
+        """Clear all cached data (thread-safe)"""
+        async with self._cache_lock:
+            self.cache.clear()
+            self.cache_hits = 0
+            self.cache_misses = 0
+            logger.info("Cache cleared")
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics"""
